@@ -209,6 +209,82 @@
             color: #58a6ff;
             font-weight: 500;
         }
+
+        .perf-cards-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .perf-stat-value {
+            font-size: 28px;
+            font-weight: 600;
+            margin-bottom: 2px;
+        }
+
+        .perf-stat-value.green {
+            color: #3fb950;
+        }
+
+        .perf-stat-value.amber {
+            color: #d29922;
+        }
+
+        .perf-stat-value.red {
+            color: #f85149;
+        }
+
+        .tier-distribution {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            margin-top: 16px;
+            flex-wrap: wrap;
+        }
+
+        .tier-bar {
+            display: flex;
+            gap: 2px;
+            align-items: stretch;
+            flex: 1;
+            min-width: 300px;
+        }
+
+        .tier-segment {
+            background-color: #3fb950;
+            border-radius: 3px;
+            position: relative;
+            min-height: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            font-weight: 600;
+            color: #0d1117;
+            overflow: hidden;
+            transition: opacity 0.15s;
+        }
+
+        .tier-segment:hover {
+            opacity: 0.85;
+        }
+
+        .tier-segment.t1 {
+            background-color: #3fb950;
+        }
+
+        .tier-segment.t2 {
+            background-color: #58a6ff;
+        }
+
+        .tier-segment.t3 {
+            background-color: #d29922;
+        }
+
+        .tier-segment.t4 {
+            background-color: #f85149;
+        }
     </style>
 </head>
 <body>
@@ -229,9 +305,11 @@
     <script>
         const API_STATS = '/api/stats';
         const API_HEALTH = '/health';
+        const API_ROUTER_EVAL = '/api/router-eval';
         const REFRESH_INTERVAL = 5000;
 
         let lastData = null;
+        let lastRouterData = null;
         let lastError = false;
 
         function formatNumber(n) {
@@ -295,6 +373,26 @@
             } catch (e) {
                 console.error('Failed to fetch health:', e);
                 return null;
+            }
+        }
+
+        async function fetchRouterEval() {
+            try {
+                const response = await fetch(API_ROUTER_EVAL);
+                if (!response.ok) throw new Error('API error');
+                lastRouterData = await response.json();
+                return lastRouterData;
+            } catch (e) {
+                console.error('Failed to fetch router eval:', e);
+                return lastRouterData || {
+                    totalDecisions: 0,
+                    downgradeRate: 0,
+                    stickyRate: 0,
+                    escalationRate: 0,
+                    regretRate: 0,
+                    byTaskType: [],
+                    tierDistribution: []
+                };
             }
         }
 
@@ -442,7 +540,123 @@
             return html;
         }
 
-        function renderContent(data) {
+        function renderRouterPerfCards(data) {
+            const regretRate = data.regretRate || 0;
+            let regretColor = 'green';
+            if (regretRate >= 0.25) regretColor = 'red';
+            else if (regretRate >= 0.10) regretColor = 'amber';
+
+            return `
+                <div class="perf-cards-grid">
+                    <div class="stat-card">
+                        <div class="stat-label">Downgrade Rate</div>
+                        <div class="perf-stat-value">${formatPercent(data.downgradeRate || 0)}</div>
+                        <div class="stat-subtext">requests sent to a cheaper model</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Sticky Rate</div>
+                        <div class="perf-stat-value">${formatPercent(data.stickyRate || 0)}</div>
+                        <div class="stat-subtext">stayed put — switching cost more</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Escalation Rate</div>
+                        <div class="perf-stat-value">${formatPercent(data.escalationRate || 0)}</div>
+                        <div class="stat-subtext">conversations bumped up when stuck</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Regret Rate</div>
+                        <div class="perf-stat-value ${regretColor}">${formatPercent(regretRate)}</div>
+                        <div class="stat-subtext">downgraded convos that later escalated (lower is better)</div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderTaskTypeTable(byTaskType) {
+            if (!byTaskType || byTaskType.length === 0) {
+                return '<p style="color: #8b949e; text-align: center; padding: 20px;">No task type data</p>';
+            }
+
+            let html = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Task</th>
+                            <th>Requests</th>
+                            <th>Avg Complexity</th>
+                            <th>Avg Tier</th>
+                            <th>Downgraded</th>
+                            <th>Saved</th>
+                            <th>Avg Latency</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            `;
+
+            byTaskType.forEach(task => {
+                html += `
+                    <tr>
+                        <td>${task.taskType || '--'}</td>
+                        <td>${task.requests || 0}</td>
+                        <td>${((task.avgComplexity || 0).toFixed(2))}</td>
+                        <td>${((task.avgRequiredTier || 0).toFixed(1))}</td>
+                        <td>${task.downgraded || 0}</td>
+                        <td>${formatUSD(task.savedUsd || 0)}</td>
+                        <td>${Math.round(task.avgLatencyMs || 0)} ms</td>
+                    </tr>
+                `;
+            });
+
+            html += `
+                    </tbody>
+                </table>
+            `;
+            return html;
+        }
+
+        function renderTierDistribution(tierDistribution) {
+            if (!tierDistribution || tierDistribution.length === 0) {
+                return '';
+            }
+
+            const totalRequests = tierDistribution.reduce((sum, t) => sum + (t.requests || 0), 0) || 1;
+            const tierMap = { 1: 't1', 2: 't2', 3: 't3', 4: 't4' };
+
+            let html = `<div class="tier-distribution"><div class="tier-bar">`;
+
+            tierDistribution.forEach(tier => {
+                const pct = ((tier.requests || 0) / totalRequests * 100).toFixed(1);
+                const tierClass = tierMap[tier.requiredTier] || 't1';
+                const minWidth = (tier.requests || 0) > 0 ? '30px' : '0px';
+                html += `<div class="tier-segment ${tierClass}" style="flex: ${tier.requests || 0}; min-width: ${minWidth}; cursor: pointer;" title="Tier ${tier.requiredTier}: ${tier.requests || 0} requests (${pct}%)">T${tier.requiredTier}</div>`;
+            });
+
+            html += `</div></div>`;
+            return html;
+        }
+
+        function renderRouterPerformance(data) {
+            if ((data.totalDecisions || 0) === 0) {
+                return '';
+            }
+
+            return `
+                <div class="section" style="display: block;">
+                    <h2 class="section-title">Router performance</h2>
+                    ${renderRouterPerfCards(data)}
+                    <div style="margin-top: 24px;">
+                        <h3 style="font-size: 14px; font-weight: 600; color: #8b949e; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.5px;">By task type</h3>
+                        ${renderTaskTypeTable(data.byTaskType || [])}
+                    </div>
+                    <div style="margin-top: 24px;">
+                        <h3 style="font-size: 14px; font-weight: 600; color: #8b949e; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Tier distribution</h3>
+                        ${renderTierDistribution(data.tierDistribution || [])}
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderContent(data, routerData) {
             if ((data.totalRequests || 0) === 0) {
                 return renderEmptyState();
             }
@@ -455,6 +669,7 @@
                         ${renderChart(data.timeline || [])}
                     </div>
                 </div>
+                ${renderRouterPerformance(routerData || {})}
                 <div class="section">
                     <h2 class="section-title">Routing decisions</h2>
                     ${renderRoutingTable(data.byRoute || [])}
@@ -473,9 +688,10 @@
 
         async function updateDashboard() {
             const data = await fetchStats();
+            const routerData = await fetchRouterEval();
             const content = document.getElementById('content');
             if (content) {
-                content.innerHTML = renderContent(data);
+                content.innerHTML = renderContent(data, routerData);
                 attachChartListeners();
             }
 

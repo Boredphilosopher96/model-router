@@ -1,6 +1,6 @@
 {
   "name": "@curliness8029/model-router",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Harness-blind LLM proxy for Bun: routes every request to the cheapest capable model (Anthropic + OpenAI), caches responses, auto-updates pricing, tracks savings on a live dashboard, and runs a request/response plugin pipeline",
   "license": "MIT",
   "type": "module",

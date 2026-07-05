@@ -7,7 +7,8 @@ model-router is configured through environment variables (runtime behavior) and 
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `4141` | Listen port. |
-| `ROUTER_MODE` | `aggressive` | `aggressive` — cheapest capable model. `balanced` — at most one tier below the requested model. `off` — never reroute (cache, stats, and plugins stay active). |
+| `ROUTER_MODE` | `aggressive` | `aggressive` — cheapest capable model. `balanced` — at most one tier below the requested model. `quality` — like `balanced` but refuses downgrade when classifier confidence < 0.65. `off` — never reroute (cache, stats, and plugins stay active). |
+| `ROUTER_STRATEGY` | `heuristic` | Classification strategy: `heuristic` — chain user taskRules, task taxonomy, and structural signals. `llm` — delegate to a tier-1 model (cached per conversation, 2s timeout, falls back to heuristic). |
 | `ROUTER_CONFIG` | `router.config.json` | Path to the upstream/allowlist/plugin declaration file. |
 | `ROUTER_ALLOWED_MODELS` | *(all)* | Comma-separated globs restricting routing targets, e.g. `claude-haiku-*,gpt-5.4-*`. Overrides the config file's `allowedModels`. |
 | `ROUTER_CROSS_PROVIDER` | `false` | Allow vendor switches (Claude ↔ GPT) on the OpenAI dialect. Same-dialect only — never format translation. |
@@ -31,12 +32,61 @@ Top-level shape:
 ```jsonc
 {
   "allowedModels": ["claude-haiku-*", "claude-opus-*", "gpt-5.4-*"],  // optional
+  "taskRules": [                                                       // optional
+    { "pattern": "\\bdeploy\\b", "tier": 3, "taskType": "release" }
+  ],
   "plugins": ["./plugins/my-telemetry.ts"],                            // optional
   "providers": [ /* upstream declarations */ ]
 }
 ```
 
 A bare array of providers is also accepted for backward compatibility. Relative `plugins` and `adapter` paths resolve against the config file's directory.
+
+### Task rules
+
+`taskRules` is an optional array of regex-based task classifiers. Each rule fires if its `pattern` regex matches the latest user message; the first match wins:
+
+```jsonc
+"taskRules": [
+  { "pattern": "\\b(deploy|release|promote)\\b", "tier": 3, "taskType": "release" },
+  { "pattern": "\\bfix\\b.*\\b(crash|error|bug)\\b", "tier": 2, "taskType": "debug" },
+  { "pattern": "^(summarize|extract|list)", "tier": 1, "taskType": "lookup" }
+]
+```
+
+Fields:
+
+- `pattern` — ECMAScript regex; matched case-insensitive against the latest user message.
+- `tier` — required capability tier (1–4) if this rule matches.
+- `taskType` — semantic label for this task (used in stats and performance tuning).
+
+If no task rule matches, the router falls back to the default heuristic (taxonomy + structural signals).
+
+### Providers field (shorthand and expanded)
+
+`providers` can be a simple array of strings (shorthand) or an array of objects (expanded):
+
+```jsonc
+"providers": [
+  "anthropic",                                           // shorthand: uses preset
+  { "name": "copilot", "preset": "github-copilot" },    // expanded: apply preset
+  { "name": "mygateway", "baseUrl": "https://..." }     // expanded: full config
+]
+```
+
+Shorthand strings are equivalent to `{ "name": "<string>", "preset": "<string>" }`. Presets populate defaults for known gateways:
+
+- `anthropic` — Anthropic API (Claude models).
+- `openai` — OpenAI API (GPT models).
+- `github-copilot` — GitHub Copilot (Copilot Models, feed-priced).
+- `github-models` — GitHub Models (GitHub-hosted open-source, feed-priced).
+- `openrouter` — OpenRouter (cross-provider gateway).
+
+Explicit fields in the object always override preset defaults. Example:
+
+```jsonc
+{ "name": "copilot", "preset": "github-copilot", "enabled": false }
+```
 
 ### Upstream fields
 
@@ -51,11 +101,12 @@ A bare array of providers is also accepted for backward compatibility. Relative 
 | `headers` | no | — | Extra static headers on every outbound request. |
 | `pricing` | no | — | Per-model pricing for models the catalog doesn't know. Registers the model too. See below. |
 | `adapter` | no | — | Module path of an `UpstreamAdapter` for endpoints with nonstandard JSON shapes. See `docs/extending.md`. |
-| `priceMultiplier` | no | automatic | Manual price scaling override. Rarely needed — see “How pricing resolves”. |
+| `priceMultiplier` | no | automatic | Manual price scaling override. Rarely needed — see "How pricing resolves". |
 | `stripV1` | no | `false` | Endpoint paths have no `/v1` segment (GitHub Copilot, GitHub Models). |
 | `vendorPrefix` | no | `false` | Send model ids vendor-prefixed with dot versions (`anthropic/claude-haiku-4.5`, OpenRouter style). |
 | `default` | no | first of its dialect | Handles bare (un-mounted) `/v1/*` traffic for its dialect. |
 | `enabled` | no | `true` | Set `false` to keep the entry but exclude it from the pool. |
+| `crossProvider` | no | `false` | This endpoint serves multiple vendors in one dialect (the GitHub and OpenRouter presets set it automatically). Lets the router swap vendors (Claude ↔ GPT) *within this endpoint*, independently of the global `ROUTER_CROSS_PROVIDER` flag. |
 
 ### Custom model pricing
 
@@ -81,8 +132,10 @@ This both registers the model in the catalog (so it can be a routing target, pri
 For every (upstream, model) pair, the first match wins:
 
 1. **Explicit `pricing` entry** on the upstream.
-2. **Live feed pricing for recognized gateway hosts.** `api.githubcopilot.com` and `models.github.ai` are recognized automatically: the feed supplies both the served-model list and per-token prices. Feed entries without per-token costs (Copilot subscription) count as zero marginal cost — the endpoint wins anything it serves.
+2. **Live feed pricing for recognized gateway hosts.** `api.githubcopilot.com`, `models.github.ai`, and `openrouter.ai` are recognized automatically: the feed supplies both the served-model list and per-token prices. GitHub Copilot has been feed-priced since June 2026 at per-token rates via AI credits (1 credit = $0.01, roughly API-parity with Claude Opus).
 3. **Catalog API pricing × `priceMultiplier`** (default `1`). This is the "assume API pricing" fallback for custom gateways serving known models.
+
+The feed also provides `cache_read_input_token_cost`, the cost for reading cached tokens (typically ~10% of the full input rate). The model catalog includes `cachedInputPer1M` for each model, enabling cache-aware pair ranking (see `docs/routing.md`).
 
 ### Model allowlist semantics
 

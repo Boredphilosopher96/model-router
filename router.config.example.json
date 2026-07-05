@@ -1,5 +1,5 @@
 {
-  "$comment": "Copy to router.config.json (or set ROUTER_CONFIG). Point each harness provider at http://localhost:4141/p/<name>. Pricing is automatic: known gateway hosts (GitHub Copilot) are priced from the live feed, unknown gateways assume catalog API pricing, and `pricing` covers models the catalog doesn't know.",
+  "$comment": "Copy to router.config.json (or set ROUTER_CONFIG). Point each harness provider at http://localhost:4141/p/<name>. Presets fill baseUrl/dialect/auth/path defaults; pricing is automatic (feed for known gateways, catalog API rates otherwise, `pricing` for private models).",
   "allowedModels": [
     "claude-haiku-*",
     "claude-sonnet-*",
@@ -7,27 +7,22 @@
     "gpt-5.4-*",
     "gpt-5.5"
   ],
+  "taskRules": [
+    {
+      "pattern": "\\\\bdeploy|release|production\\\\b",
+      "tier": 3,
+      "taskType": "release"
+    }
+  ],
   "plugins": [
     "./examples/plugins/my-telemetry.ts"
   ],
   "providers": [
-    {
-      "name": "anthropic",
-      "baseUrl": "https://api.anthropic.com",
-      "dialect": "anthropic",
-      "models": [
-        "claude-*"
-      ],
-      "apiKeyEnv": "ANTHROPIC_API_KEY",
-      "default": true
-    },
+    "anthropic",
     {
       "name": "copilot",
-      "baseUrl": "https://api.githubcopilot.com",
-      "dialect": "openai",
-      "authStyle": "passthrough",
-      "stripV1": true,
-      "$comment": "No models/pricing needed: the host is recognized, so served models and subscription (zero marginal cost) pricing come from the feed automatically."
+      "preset": "github-copilot",
+      "$comment": "Preset covers endpoint/paths/cross-vendor. Served models come from the live feed; billed per token in AI credits at ~API rates (Copilot dropped flat-rate billing in June 2026)."
     },
     {
       "name": "mygateway",
@@ -52,19 +47,11 @@
         }
       },
       "adapter": "./examples/adapters/mygateway.ts",
-      "$comment": "Known models (claude-*, gpt-*) assume catalog API pricing automatically. `pricing` registers + prices the private model. `adapter` (optional) reshapes request/response JSON if this gateway deviates from the standard dialects."
+      "$comment": "Known models assume catalog API pricing automatically; `pricing` registers + prices the private model; `adapter` reshapes deviant JSON."
     },
     {
       "name": "openrouter",
-      "baseUrl": "https://openrouter.ai/api",
-      "dialect": "openai",
-      "models": [
-        "claude-*",
-        "gpt-*"
-      ],
-      "apiKeyEnv": "OPENROUTER_API_KEY",
-      "authStyle": "bearer",
-      "vendorPrefix": true,
+      "preset": "openrouter",
       "enabled": false
     }
   ]

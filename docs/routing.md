@@ -6,9 +6,24 @@ Every inference request goes through the same pipeline. The design constraint be
 
 The path determines the wire format: `/v1/messages` is Anthropic dialect; `/v1/chat/completions` and `/v1/responses` are OpenAI dialect. The mount (`/p/<name>` prefix, or the dialect's `default` upstream for bare paths) determines the request's **home** upstream.
 
-## 2. Complexity → required tier
+## 2. Strategy stage — classify the task
 
-`estimateComplexity()` scores the request 0–1 from independent signals, each saturating on its own scale:
+Before ranking models, the router runs a pluggable classification strategy to determine `{taskType, requiredTier, complexity, confidence}`:
+
+**Default "heuristic" strategy** chains four signals:
+
+1. **User-defined task rules** — `taskRules` in config (regexes + tier/taskType); first match wins. Skip to step 2 if no match.
+2. **Task taxonomy** — keyword banks (regexes) over the latest user message; intent beats size, so a five-word "why does this deadlock?" still classifies as debug. Lookup/summarize/extract/edit → tier 1; codegen/debug → tier 2; architecture/deep-reasoning → tier 3.
+3. **Trivial bypass** — only when the taxonomy found nothing demanding: a short single-turn ask with no tools, code, or bulk lands on tier 1 with high confidence.
+4. **Structural signals** — adjust the tier upward based on prompt size, tool count, conversation depth, output budget, code-fence density, and agentic depth (via `tool_result` count in history).
+
+The result is a classification record with confidence 0–1; the router uses it to set the tier floor.
+
+**Optional "llm" strategy** (`ROUTER_STRATEGY=llm`): a tier-1 model classifies each new conversation once, with result cached per conversation (2-second timeout, falls back to heuristic if it times out). Useful when task intent varies sharply from the prompt's surface signals.
+
+## 3. Complexity → tier floor
+
+The heuristic strategy computes a complexity score 0–1 from structural signals:
 
 | Signal | Saturates at |
 |---|---|
@@ -16,22 +31,26 @@ The path determines the wire format: `/v1/messages` is Anthropic dialect; `/v1/c
 | Tool count | 8 tools |
 | Conversation depth | 30 turns |
 | Requested output (`max_tokens` / `max_output_tokens`) | 32k tokens |
-| Hard-task keywords in the last user turn (refactor, debug, architect, prove, …) | flat bonus |
+| Code-fence density | 6 fenced blocks |
+| Agentic depth (`tool_result` blocks in history) | 10 prior tool calls |
 
-The score maps to a minimum capability tier: `<0.25` → 1, `<0.5` → 2, `<0.75` → 3, else 4.
+Structural signals adjust the taxonomy tier upward (they never lower it): very large prompts or output budgets, heavy tool+code use, and sustained agentic execution each add a tier step. The continuous score is also persisted per request for evaluation.
 
-## 3. Ceiling and floor
+## 4. Tier floor and ceiling
 
-- The **requested model's tier is the ceiling** — the router downgrades, never upgrades, so the model your harness asks for is the spend cap.
-- **`auto` has no ceiling**: the router picks freely by complexity.
-- **`balanced` mode** raises the floor to one tier below the requested model.
-- **Escalation** (below) can raise both floor and ceiling — that is the one sanctioned way above the requested tier.
+- **Tier floor** is set by the strategy result (taskType, requiredTier, and complexity).
+- **Tier ceiling** is the requested model's tier — the router downgrades, never upgrades.
+- **`auto` has no ceiling**: the router picks freely.
+- **`quality` mode** raises the floor and adds a confidence gate: refuses downgrade when classifier confidence < 0.65.
+- **`balanced` mode** raises the floor to one tier below the ceiling (conservative).
+- **`aggressive` mode** (default) downgrades to floor if cost savings justify it.
+- **Escalation** (below) can raise both floor and ceiling — that is the one sanctioned way above the ceiling.
 
-## 4. Capability constraints
+## 5. Capability constraints
 
 Requests carrying images, documents, or audio only route to models with `vision` support; requests declaring tools only route to models with `toolUse` support. Capability flags come from the live feed; unknown capability fails open (assumed capable).
 
-## 5. Pair selection
+## 6. Cache-aware pair ranking
 
 Candidates are every (model, upstream) combination where:
 
@@ -39,9 +58,23 @@ Candidates are every (model, upstream) combination where:
 - the model stays in the requested model's vendor family (Claude→Claude), unless `ROUTER_CROSS_PROVIDER=true` and the dialect is OpenAI;
 - the upstream speaks the request's dialect, serves the model, and is either the request's home or has its own configured credentials.
 
-Pairs are sorted by **effective price** (see `docs/configuration.md` → How pricing resolves); ties prefer the home upstream. The winner's model id is written in the form that upstream expects (namespace style preserved, `vendorPrefix` applied).
+Pairs are sorted by **estimated request cost**, accounting for response caching:
 
-## 6. Escalation — bumping when stuck
+- **If the (model, upstream) pair last served this conversation**, its cached history tokens bill at the upstream's cached-input rate (typically ~10% of full input rate, sourced from the feed's `cache_read_input_token_cost` or 0.1x default).
+- **If switching to a new (model, upstream)**, the entire conversation history re-feeds at full input cost.
+
+Consequence: long conversations stick to their current model unless switching genuinely saves money; short conversations can switch freely. When a decision sticks for cache cost reasons, the response includes `x-router-sticky: 1` and the decision record carries `sticky: true`.
+
+**Worked example** (catalog rates): a conversation has 400k tokens of history, warm on Claude Opus 4.8 ($5.00/1M input, $0.50/1M cached input). A trivial follow-up arrives.
+
+- Stay on Opus: 400k x $0.50/1M = **$0.20** for the history (plus a little fresh input/output).
+- Switch to Haiku 4.5 ($1.00/1M input): 400k x $1.00/1M = **$0.40** — the whole history re-feeds cold.
+
+Staying on the "expensive" model is half the price, so the router sticks (`sticky: true`). Early in a conversation the history is small, the cache advantage is negligible, and the cheap model wins as usual.
+
+Ties prefer the home upstream. The winner's model id is written in the form that upstream expects (namespace style preserved, `vendorPrefix` applied).
+
+## 7. Escalation — bumping when stuck
 
 The tracker keys conversations by a stable fingerprint (system prompt + first user turn), so a growing conversation keeps its identity across requests. Signals that a conversation is struggling:
 
@@ -51,7 +84,7 @@ The tracker keys conversations by a stable fingerprint (system prompt + first us
 
 Every 3 signals add +1 tier boost (max +2 by default); 4 clean responses remove one level; idle conversations are forgotten after 30 minutes. A boost raises the tier floor *and* ceiling, so a conversation stuck on a tier-1 model can be bumped to tier 2 or 3 even though it asked for the tier-1 model. Active boosts are visible at `GET /api/escalations` and on responses as `x-router-escalation`.
 
-## 7. Fail-open guarantees
+## 8. Fail-open guarantees
 
 The router never blocks traffic it doesn't understand:
 
@@ -61,6 +94,39 @@ The router never blocks traffic it doesn't understand:
 - plugin/adapter failure → logged, skipped, request proceeds;
 - upstream error → the provider's status and body pass through untouched so the harness sees the real failure.
 
+## Evaluation loop
+
+Monitor router decisions via `GET /api/router-eval`:
+
+```json
+{
+  "totalDecisions": 15420,
+  "downgradeRate": 0.42,
+  "stickyRate": 0.11,
+  "escalationRate": 0.03,
+  "regretRate": 0.05,
+  "byTaskType": [
+    { "taskType": "codegen", "requests": 3200, "avgComplexity": 0.31,
+      "avgRequiredTier": 2.1, "downgraded": 1750, "savedUsd": 4.21, "avgLatencyMs": 2100 },
+    { "taskType": "lookup", "requests": 2100, "avgComplexity": 0.05,
+      "avgRequiredTier": 1.0, "downgraded": 1960, "savedUsd": 2.02, "avgLatencyMs": 800 }
+  ],
+  "tierDistribution": [
+    { "requiredTier": 1, "requests": 6200 },
+    { "requiredTier": 2, "requests": 5300 }
+  ]
+}
+```
+
+Key metrics:
+
+- **downgradeRate** — share of requests routed below the requested model's tier. High rate suggests you are scaling models conservatively; near-zero suggests the opposite.
+- **stickyRate** — share of decisions where cache-aware ranking kept a conversation on its current (expensive) model. Signals conversation length and cost stability.
+- **regretRate** — share of downgraded conversations that later escalated, indicating the router misjudged and the harness had to climb the tier. High regret (>0.10) means too aggressive; tune task rules or raise the floor.
+- **byTaskType** — per-task breakdown; compare downgradeRate across types to refine rules.
+
+The dashboard includes a "Router performance" section rendering these metrics and trends over time.
+
 ## Harness blindness
 
-Responses report the `model` the harness asked for (except `auto`, which reports the real pick). The actual decision is exposed out-of-band: `x-router-requested-model`, `x-router-routed-model`, `x-router-upstream`, `x-router-reason`, `x-router-cache`, `x-router-escalation` response headers, plus the dashboard and stats API. Streaming bodies are passed through untouched, so event payloads name the real model — the headers remain the source of truth.
+Responses report the `model` the harness asked for (except `auto`, which reports the real pick). The actual decision is exposed out-of-band: `x-router-requested-model`, `x-router-routed-model`, `x-router-upstream`, `x-router-reason`, `x-router-cache`, `x-router-escalation`, and `x-router-task` response headers, plus the dashboard and stats API. Streaming bodies are passed through untouched, so event payloads name the real model — the headers remain the source of truth. Sticky decisions also include `x-router-sticky: 1`.

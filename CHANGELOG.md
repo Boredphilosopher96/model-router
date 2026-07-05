@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-07-05
+
+### Added
+
+- **Pluggable routing strategy** — configurable classification stage before pair selection: default "heuristic" chains user taskRules (regexes), task taxonomy extraction, and structural signals; optional "llm" strategy delegates to a tier-1 model (cached per conversation, 2s timeout, falls back to heuristic).
+- **Task rules** — regex-based rules in config (`taskRules`) with pattern, tier, and taskType to override default complexity scoring.
+- **Cache-aware pair ranking** — estimated request cost accounts for cached input tokens at reduced rates (~10% of full rate); long conversations stick to warm models unless switching genuinely saves money; decisions carry `sticky: true` flag.
+- **Quality mode** (`ROUTER_MODE=quality`) — refuses downgrade when classifier confidence < 0.65, for workflows where wrong answers cost more than latency.
+- **Plugin priority and match scoping** — `priority` field orders plugins (lower runs first); `match` field filters by mounts, dialects, and model globs; enables coexistence with harness and provider-specific plugins.
+- **composePlugins()** — utility to merge multiple plugins with stable priority and match scope.
+- **Provider presets** — shorthand provider syntax (`"providers": ["anthropic"]`) and expanded object form with preset support (anthropic, openai, github-copilot, github-models, openrouter); explicit fields override preset defaults.
+- **Per-upstream crossProvider** — `crossProvider: true` on an upstream lets the router swap vendors (Claude ↔ GPT) within that endpoint's dialect when `ROUTER_CROSS_PROVIDER=true`.
+- **Evaluation API** (`GET /api/router-eval`) — metrics on downgradeRate, stickyRate, escalationRate, regretRate (share of downgraded conversations that later escalated), breakdown by taskType and tier distribution; dashboard includes "Router performance" section.
+- **Task type in context** — plugins receive `ctx.taskType` from the routing strategy.
+- **New response headers** — `x-router-task` (always), `x-router-sticky` (when sticky), `x-router-escalation` updated to `x-router-escalation-boost`.
+- **Stats persistence** — recorded decisions now include taskType, complexity, requiredTier, boost, sticky flag, and conversation key for post-hoc analysis.
+
+### Changed
+
+- **ROUTER_MODE behaviors** — `balanced` now targets one tier below ceiling (was two); `quality` mode added as a new tier-1-aware option.
+- **ROUTER_STRATEGY env** — new env var to select classification strategy (heuristic | llm).
+- **Model catalog** — added `cachedInputPer1M` field for cache-aware cost estimation.
+- **Pricing resolution** — feed now supplies cache_read_input_token_cost; all recognized gateways (including GitHub Copilot) priced at per-token rates from the live feed.
+
+### Fixed
+
+- **GitHub Copilot flat-rate assumption removed** — Copilot has billed per token via AI credits since June 2026 (1 credit = $0.01, roughly API-parity per-model rates). The router now prices it from the live feed, falling back to catalog rates; feed entries without costs count as availability data only, never as "free". Documentation updated accordingly.
+- **Stray empty test artifacts** — removed unused mock data files from test suite.
+
 ## [1.0.0] - 2026-07-04
 
 ### Added

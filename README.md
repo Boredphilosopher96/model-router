@@ -12,7 +12,7 @@ It sits between any coding agent and any number of model endpoints, looks at eac
 
 ```
                         ┌──────────────────────────┐      ┌─ anthropic api (claude-*)
- Claude Code ──┐        │       model-router       │      ├─ github copilot (flat-rate)
+ Claude Code ──┐        │       model-router       │      ├─ github copilot
  opencode ─────┼──────► │  dialect-aware routing   │ ───► ├─ your gateway (both dialects)
  Codex CLI ────┤        │  cache · escalation ·    │      ├─ openrouter
  Copilot BYOK ─┘        │  savings · plugins       │      └─ openai api (gpt-*)
@@ -23,9 +23,13 @@ It sits between any coding agent and any number of model endpoints, looks at eac
 
 Coding agents default to expensive frontier models for every request — including the trivial ones. And if you run several providers (a Copilot subscription, direct APIs, an internal gateway), the cheapest way to serve any given request keeps shifting. model-router makes that decision per request, invisibly:
 
-- **Cheapest capable (model, endpoint) pair.** A complexity heuristic picks the minimum capability tier; the router scans every endpoint that speaks the request's dialect and picks by effective price. A flat-rate subscription endpoint (like GitHub Copilot — priced automatically from a live feed) wins everything it can serve.
+- **Content-aware task classification.** The router extracts intent from each request: lookup/summarize → tier 1, codegen/debug → tier 2, architecture/reasoning → tier 3. User-defined regex rules override. Optional LLM-based classification for complex patterns. Confidence gates prevent aggressive downgrade when unsure.
+- **Cache-aware stickiness.** When a conversation has warm cache on an expensive model, staying put costs less than switching to a cheaper model cold. The router knows the difference and sticks only when it saves money — switching frequently for short tasks, staying put for long ones. Sticky decisions are labeled in headers.
+- **Quality mode** — refuses downgrade when classifier confidence < 0.65, for workflows where "wrong answer faster" loses money.
 - **Escalates when stuck.** Repeated failures, erroring tool calls, or retry loops bump that conversation up a tier — even above the model it asked for — then decay back after sustained success.
-- **Never gets stale.** The model catalog, prices, capability flags, and gateway availability refresh daily from a maintained feed. New model generations supersede old ones automatically. Zero manual updates.
+- **Presets for fast setup.** Declare providers by name (`"providers": ["anthropic", {"name":"copilot","preset":"github-copilot"}]`), inheriting defaults from built-in presets (Anthropic, OpenAI, GitHub Copilot, GitHub Models, OpenRouter).
+- **Router performance dashboard.** Live metrics on downgrade rate, sticky rate, escalation rate, regret rate (downgraded conversations that later escalated — the router's misjudgment signal), breakdowns by task type, and tier distribution for tuning.
+- **Never gets stale.** The model catalog, prices, capability flags, and gateway availability refresh daily from a maintained feed. GitHub Copilot prices via AI credits at per-token rates. New model generations automatically supersede old ones. Zero manual updates.
 - **Never gets in the way.** Unknown models, unparseable requests, feed outages, broken plugins — everything fails open and passes through. Provider errors reach your harness untouched.
 - **Proves the savings.** Every request is logged with actual cost vs. what the requested model would have cost, on a live dashboard.
 
@@ -55,19 +59,18 @@ cp router.config.example.json router.config.json    # then edit
 ```jsonc
 {
   "allowedModels": ["claude-haiku-*", "claude-sonnet-*", "claude-opus-*", "gpt-5.4-*", "gpt-5.5"],
+  "taskRules": [
+    { "pattern": "\\b(deploy|release|promote)\\b", "tier": 3, "taskType": "release" }
+  ],
   "providers": [
-    { "name": "anthropic", "baseUrl": "https://api.anthropic.com", "dialect": "anthropic",
-      "models": ["claude-*"], "apiKeyEnv": "ANTHROPIC_API_KEY", "default": true },
-
-    // Copilot: no model list or pricing needed — recognized host, feed-driven,
-    // subscription counts as zero marginal cost so it wins whatever it serves.
-    { "name": "copilot", "baseUrl": "https://api.githubcopilot.com", "dialect": "openai",
-      "authStyle": "passthrough", "stripV1": true },
-
-    { "name": "mygateway", "baseUrl": "https://llm.internal.example.com", "dialect": "both",
+    "anthropic",
+    { "name": "copilot", "preset": "github-copilot" },
+    {
+      "name": "mygateway", "baseUrl": "https://llm.internal.example.com", "dialect": "both",
       "models": ["claude-*", "gpt-*", "my-private-model"],
       "apiKeyEnv": "MYGATEWAY_API_KEY", "authStyle": "bearer",
-      "pricing": { "my-private-model": { "inputPer1M": 0.5, "outputPer1M": 2.0, "tier": 2 } } }
+      "pricing": { "my-private-model": { "inputPer1M": 0.5, "outputPer1M": 2.0, "tier": 2 } }
+    }
   ]
 }
 ```
@@ -78,16 +81,20 @@ Each provider becomes a mount — point each harness provider at `http://localho
 
 | | |
 |---|---|
-| **Cost routing** | Cheapest capable (model, endpoint) pair per request; requested model is the spend ceiling; three modes (`aggressive` / `balanced` / `off`) |
-| **Automatic pricing** | Live feed for known gateways (Copilot subscription detected as zero marginal cost); catalog API pricing assumed for custom gateways; `pricing` entries for private models |
+| **Cost routing** | Cheapest capable (model, endpoint) pair per request; requested model is the spend ceiling; four modes (`aggressive` / `balanced` / `quality` / `off`) |
+| **Task classification** | Content-aware heuristic (regex rules → task taxonomy → structural signals) or optional LLM-based classifier; per-request taskType and confidence |
+| **Cache-aware stickiness** | Long conversations stay on warm models only when it saves money; short tasks can switch freely. Sticky decisions labeled in response headers |
+| **Quality mode** | Like `balanced` but refuses downgrade when classifier confidence < 0.65 |
+| **Automatic pricing** | Live feed for known gateways; GitHub Copilot priced per token via AI credits; catalog API pricing assumed for custom gateways; `pricing` entries for private models |
 | **Escalation** | Stuck conversations bump up a tier and settle back; observable at `/api/escalations` |
 | **`auto` model** | Advertised via `GET /v1/models`; selecting it delegates the whole choice to the router |
 | **Model allowlist** | `allowedModels` globs restrict routing targets; everything else still passes through |
 | **Multimodal-safe** | Image/document/audio requests only route to vision-capable models; tool-calling requests only to tool-capable models |
 | **Response cache** | SQLite, TTL-based; identical requests are served for free |
-| **Plugins** | `onRequest` / `onRouteDecision` / `onResponse` / `onRecord` hooks; loadable from config without forking |
-| **Adapters** | Per-upstream request/response reshaping for gateways with nonstandard JSON |
-| **Dashboard** | Money saved, downgrades, cache hit rate, per-model and per-route breakdowns |
+| **Plugins** | `onRequest` / `onRouteDecision` / `onResponse` / `onRecord` hooks; match scoping; priority ordering; loadable from config without forking |
+| **Adapters** | Per-upstream request/response reshaping for gateways with nonstandard JSON; `composePlugins()` for merging related plugins |
+| **Presets** | `"providers": ["anthropic", {"name":"copilot","preset":"github-copilot"}]` — endpoint/auth/path defaults for known gateways |
+| **Dashboard** | Money saved, downgrade rate, cache hit rate, router performance (regret rate, sticky rate, escalation rate, task type breakdown), per-model and per-route tables |
 | **Streaming** | Byte-for-byte SSE passthrough with usage teed out for stats |
 
 ## Documentation

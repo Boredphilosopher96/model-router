@@ -11,6 +11,7 @@ import type { ProxyPlugin } from "@curliness8029/model-router";
 
 const plugin: ProxyPlugin = {
   name: "my-plugin",
+  priority: 50,                          // optional; lower runs earlier (default 100)
 
   // Transform the incoming request body before routing.
   onRequest(body, ctx) {
@@ -37,7 +38,45 @@ const plugin: ProxyPlugin = {
 };
 ```
 
-**Ordering.** `onRequest`, `onRouteDecision`, and `onRecord` run in registration order; `onResponse` runs in reverse, so a plugin wraps the ones registered after it. A hook that throws is logged and skipped.
+**Plugin context.** `ctx` includes `mount` (the upstream name) and `taskType` (from the routing strategy) in addition to the request/decision data.
+
+**Ordering and priority.** By default, plugins run in registration order. The `priority` field allows fine-grained control: lower numbers run earlier (default `100`). `onRequest`, `onRouteDecision`, and `onRecord` run in priority order; `onResponse` runs in reverse (so a plugin wraps the ones registered after it). A hook that throws is logged and skipped.
+
+**Match scoping.** Restrict a plugin to specific traffic with the `match` field:
+
+```ts
+{
+  name: "mygateway-telemetry",
+  priority: 50,
+  match: {
+    mounts: ["mygateway"],             // only this upstream
+    dialects: ["anthropic"],           // only Anthropic-dialect requests
+    models: ["claude-*"]               // glob: only these models
+  },
+  onRecord(record, ctx) {
+    mygateway.recordMetrics(record);
+  }
+}
+```
+
+This pattern lets model-router plugins coexist with harness-level plugins and provider-specific plugins without touching each other's traffic. Matchers default to matching everything (unset = unrestricted); all specified filters must pass.
+
+**Composing plugins.** Merge multiple plugins into one with stable priority and scoping:
+
+```ts
+import { composePlugins } from "@curliness8029/model-router";
+
+const merged = composePlugins("telemetry-suite", [
+  budgetEnforcer,
+  costTracker,
+  alerting
+], {
+  priority: 40,
+  match: { mounts: ["mygateway"] }
+});
+```
+
+All hooks from composed plugins run in the order registered, wrapped by the match filter. Useful for grouping related plugins and ensuring they apply only to specific traffic.
 
 **Three ways to register:**
 
@@ -48,7 +87,7 @@ const plugin: ProxyPlugin = {
    { "plugins": ["./plugins/my-telemetry.ts"] }
    ```
 
-   The module's default export must be a `ProxyPlugin` or a zero-arg factory returning one. Template: `examples/plugins/my-telemetry.ts`.
+   The module's default export must be a `ProxyPlugin`, array of plugins, or zero-arg factory returning one. Template: `examples/plugins/my-telemetry.ts`.
 
 2. **Library API**:
 

@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Model Router Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+            background-color: #0d1117;
+            color: #c9d1d9;
+            font-feature-settings: "tnum" 1;
+            font-variant-numeric: tabular-nums;
+            padding: 24px;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 32px;
+            flex-wrap: wrap;
+            gap: 16px;
+        }
+
+        .header h1 {
+            font-size: 28px;
+            font-weight: 600;
+            color: #c9d1d9;
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+
+        .last-refreshed {
+            font-size: 13px;
+            color: #8b949e;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 4px 12px;
+            background-color: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 500;
+            color: #58a6ff;
+        }
+
+        .badge.disconnected {
+            color: #f85149;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 80px 24px;
+        }
+
+        .empty-state p {
+            font-size: 16px;
+            color: #8b949e;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 32px;
+        }
+
+        .stat-card {
+            background-color: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 16px;
+        }
+
+        .stat-label {
+            font-size: 12px;
+            color: #8b949e;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+        }
+
+        .stat-value {
+            font-size: 24px;
+            font-weight: 600;
+            color: #c9d1d9;
+            word-break: break-word;
+        }
+
+        .stat-value.green {
+            color: #3fb950;
+        }
+
+        .stat-subtext {
+            font-size: 12px;
+            color: #8b949e;
+            margin-top: 4px;
+        }
+
+        .section {
+            margin-bottom: 32px;
+        }
+
+        .section-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            color: #c9d1d9;
+        }
+
+        .chart-container {
+            background-color: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 16px;
+            overflow-x: auto;
+            height: 280px;
+            display: flex;
+            align-items: flex-end;
+        }
+
+        svg {
+            width: 100%;
+            height: 100%;
+        }
+
+        .bar {
+            fill: #3fb950;
+            cursor: pointer;
+            transition: opacity 0.15s;
+        }
+
+        .bar:hover {
+            opacity: 0.8;
+        }
+
+        .tooltip {
+            position: absolute;
+            background-color: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 4px;
+            padding: 8px 12px;
+            font-size: 12px;
+            color: #c9d1d9;
+            pointer-events: none;
+            z-index: 1000;
+            white-space: nowrap;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background-color: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+
+        thead {
+            background-color: #0d1117;
+            border-bottom: 1px solid #30363d;
+        }
+
+        th {
+            padding: 12px 16px;
+            text-align: left;
+            font-size: 12px;
+            font-weight: 600;
+            color: #8b949e;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        td {
+            padding: 12px 16px;
+            border-bottom: 1px solid #30363d;
+            font-size: 14px;
+        }
+
+        tbody tr:last-child td {
+            border-bottom: none;
+        }
+
+        tbody tr:hover {
+            background-color: #0d1117;
+        }
+
+        .arrow {
+            color: #58a6ff;
+            font-weight: 500;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Model Router</h1>
+            <div class="header-right">
+                <span class="last-refreshed">Last refreshed: <span id="refresh-time">never</span></span>
+                <div id="mode-badge" class="badge">--</div>
+            </div>
+        </div>
+
+        <div id="content"></div>
+    </div>
+
+    <div id="tooltip" class="tooltip" style="display: none;"></div>
+
+    <script>
+        const API_STATS = '/api/stats';
+        const API_HEALTH = '/health';
+        const REFRESH_INTERVAL = 5000;
+
+        let lastData = null;
+        let lastError = false;
+
+        function formatNumber(n) {
+            if (n === undefined || n === null) return '0';
+            if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+            if (n >= 1e3) return (n / 1e3).toFixed(2) + 'k';
+            return n.toFixed(0);
+        }
+
+        function formatUSD(n) {
+            if (n === undefined || n === null) return '$0.0000';
+            return '$' + n.toFixed(4);
+        }
+
+        function formatPercent(n) {
+            if (n === undefined || n === null) return '0%';
+            return (n * 100).toFixed(1) + '%';
+        }
+
+        function timeAgo(date) {
+            const now = new Date();
+            const diff = Math.floor((now - date) / 1000);
+            if (diff < 60) return 'now';
+            if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+            if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+            return Math.floor(diff / 86400) + 'd ago';
+        }
+
+        async function fetchStats() {
+            try {
+                const response = await fetch(API_STATS);
+                if (!response.ok) throw new Error('API error');
+                lastData = await response.json();
+                lastError = false;
+                return lastData;
+            } catch (e) {
+                console.error('Failed to fetch stats:', e);
+                lastError = true;
+                return lastData || {
+                    totalRequests: 0,
+                    downgradedRequests: 0,
+                    cacheHits: 0,
+                    cacheHitRate: 0,
+                    totalInputTokens: 0,
+                    totalOutputTokens: 0,
+                    totalCostActualUsd: 0,
+                    totalCostBaselineUsd: 0,
+                    totalSavedUsd: 0,
+                    byModel: [],
+                    byRoute: [],
+                    timeline: []
+                };
+            }
+        }
+
+        async function fetchHealth() {
+            try {
+                const response = await fetch(API_HEALTH);
+                if (!response.ok) throw new Error('Health check failed');
+                return await response.json();
+            } catch (e) {
+                console.error('Failed to fetch health:', e);
+                return null;
+            }
+        }
+
+        function renderEmptyState() {
+            return `
+                <div class="empty-state">
+                    <p>No traffic yet — point your agent at this proxy and stats will appear here.</p>
+                </div>
+            `;
+        }
+
+        function renderStatCards(data) {
+            const totalTokens = (data.totalInputTokens || 0) + (data.totalOutputTokens || 0);
+            return `
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-label">Total Requests</div>
+                        <div class="stat-value">${formatNumber(data.totalRequests || 0)}</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Routed to Cheaper</div>
+                        <div class="stat-value">${data.downgradedRequests || 0}</div>
+                        <div class="stat-subtext">${formatPercent((data.downgradedRequests || 0) / (data.totalRequests || 1))}</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Money Saved</div>
+                        <div class="stat-value green">${formatUSD(data.totalSavedUsd || 0)}</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Actual Spend</div>
+                        <div class="stat-value">${formatUSD(data.totalCostActualUsd || 0)}</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Baseline Spend</div>
+                        <div class="stat-value">${formatUSD(data.totalCostBaselineUsd || 0)}</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Cache Hit Rate</div>
+                        <div class="stat-value">${formatPercent(data.cacheHitRate || 0)}</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Total Tokens</div>
+                        <div class="stat-value">${formatNumber(totalTokens)}</div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderChart(timeline) {
+            if (!timeline || timeline.length === 0) {
+                return '<p style="color: #8b949e; text-align: center; padding: 20px;">No timeline data</p>';
+            }
+
+            const maxSaved = Math.max(...timeline.map(d => d.savedUsd || 0), 1);
+            const barWidth = Math.max(20, Math.min(60, 800 / timeline.length));
+            const chartWidth = timeline.length * barWidth + (timeline.length - 1) * 8;
+            const chartHeight = 200;
+            const padding = 40;
+
+            let svg = `<svg viewBox="0 0 ${chartWidth + 2 * padding} ${chartHeight + 2 * padding}" xmlns="http://www.w3.org/2000/svg">`;
+
+            timeline.forEach((point, i) => {
+                const height = (point.savedUsd || 0) / maxSaved * chartHeight;
+                const x = padding + i * (barWidth + 8);
+                const y = padding + chartHeight - height;
+
+                svg += `<rect class="bar" x="${x}" y="${y}" width="${barWidth}" height="${height}" data-hour="${point.hourIso}" data-requests="${point.requests || 0}" data-saved="${point.savedUsd || 0}" data-cache="${point.cacheHits || 0}" />`;
+            });
+
+            svg += `</svg>`;
+            return svg;
+        }
+
+        function renderRoutingTable(byRoute) {
+            if (!byRoute || byRoute.length === 0) {
+                return '<p style="color: #8b949e; text-align: center; padding: 20px;">No routing data</p>';
+            }
+
+            let html = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Route</th>
+                            <th>Requests</th>
+                            <th>Saved</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            `;
+
+            byRoute.forEach(route => {
+                html += `
+                    <tr>
+                        <td>${route.requestedModel || '--'} <span class="arrow">→</span> ${route.routedModel || '--'}</td>
+                        <td>${route.requests || 0}</td>
+                        <td>${formatUSD(route.savedUsd || 0)}</td>
+                    </tr>
+                `;
+            });
+
+            html += `
+                    </tbody>
+                </table>
+            `;
+            return html;
+        }
+
+        function renderModelTable(byModel) {
+            if (!byModel || byModel.length === 0) {
+                return '<p style="color: #8b949e; text-align: center; padding: 20px;">No model data</p>';
+            }
+
+            let html = `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Model</th>
+                            <th>Requests</th>
+                            <th>Input Tokens</th>
+                            <th>Output Tokens</th>
+                            <th>Actual Cost</th>
+                            <th>Saved</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            `;
+
+            byModel.forEach(model => {
+                html += `
+                    <tr>
+                        <td>${model.routedModel || '--'}</td>
+                        <td>${model.requests || 0}</td>
+                        <td>${formatNumber(model.inputTokens || 0)}</td>
+                        <td>${formatNumber(model.outputTokens || 0)}</td>
+                        <td>${formatUSD(model.costActualUsd || 0)}</td>
+                        <td>${formatUSD(model.savedUsd || 0)}</td>
+                    </tr>
+                `;
+            });
+
+            html += `
+                    </tbody>
+                </table>
+            `;
+            return html;
+        }
+
+        function renderContent(data) {
+            if ((data.totalRequests || 0) === 0) {
+                return renderEmptyState();
+            }
+
+            return `
+                ${renderStatCards(data)}
+                <div class="section">
+                    <h2 class="section-title">Savings over time</h2>
+                    <div class="chart-container">
+                        ${renderChart(data.timeline || [])}
+                    </div>
+                </div>
+                <div class="section">
+                    <h2 class="section-title">Routing decisions</h2>
+                    ${renderRoutingTable(data.byRoute || [])}
+                </div>
+                <div class="section">
+                    <h2 class="section-title">Per-model usage</h2>
+                    ${renderModelTable(data.byModel || [])}
+                </div>
+            `;
+        }
+
+        function updateRefreshTime() {
+            const el = document.getElementById('refresh-time');
+            if (el) el.textContent = new Date().toLocaleTimeString();
+        }
+
+        async function updateDashboard() {
+            const data = await fetchStats();
+            const content = document.getElementById('content');
+            if (content) {
+                content.innerHTML = renderContent(data);
+                attachChartListeners();
+            }
+
+            const badge = document.getElementById('mode-badge');
+            if (lastError) {
+                badge.textContent = 'disconnected';
+                badge.classList.add('disconnected');
+            } else {
+                const health = await fetchHealth();
+                if (health && health.mode) {
+                    badge.textContent = health.mode;
+                    badge.classList.remove('disconnected');
+                } else {
+                    badge.textContent = '--';
+                }
+            }
+
+            updateRefreshTime();
+        }
+
+        function attachChartListeners() {
+            const bars = document.querySelectorAll('.bar');
+            const tooltip = document.getElementById('tooltip');
+
+            bars.forEach(bar => {
+                bar.addEventListener('mouseenter', (e) => {
+                    const hour = bar.getAttribute('data-hour');
+                    const requests = bar.getAttribute('data-requests');
+                    const saved = bar.getAttribute('data-saved');
+                    const cache = bar.getAttribute('data-cache');
+
+                    tooltip.innerHTML = `
+                        ${new Date(hour).toLocaleString()}<br>
+                        Requests: ${requests}<br>
+                        Saved: ${formatUSD(parseFloat(saved))}<br>
+                        Cache: ${cache}
+                    `;
+                    tooltip.style.display = 'block';
+                });
+
+                bar.addEventListener('mousemove', (e) => {
+                    tooltip.style.left = (e.clientX + 8) + 'px';
+                    tooltip.style.top = (e.clientY + 8) + 'px';
+                });
+
+                bar.addEventListener('mouseleave', () => {
+                    tooltip.style.display = 'none';
+                });
+            });
+        }
+
+        updateDashboard();
+        setInterval(updateDashboard, REFRESH_INTERVAL);
+    </script>
+</body>
+</html>

@@ -15,6 +15,9 @@ export {
 } from "./registry.ts";
 export { Upstreams, loadUpstreams, loadRouterSetup, resolveUpstream, toStyleOf, kindOf, PRESETS, DEFAULT_UPSTREAMS } from "./upstreams.ts";
 export { EscalationTracker, conversationKey, DEFAULT_ESCALATION } from "./escalation.ts";
+export { UpstreamHealth, DEFAULT_HEALTH } from "./health.ts";
+export { BudgetGuard } from "./budget.ts";
+export { Calibrator, DEFAULT_CALIBRATION, type CalibrationRecommendation } from "./calibration.ts";
 export { loadConfig } from "./config.ts";
 export { startPriceAutoUpdate, parseFeed, parseGatewayFeed, gatewayPricing, familyOf, DEFAULT_FEED_URL } from "./pricefeed.ts";
 export { createCache, cacheKey } from "./cache.ts";

@@ -62,6 +62,8 @@ export interface RouteInputs {
   escalationBoost?: number;
   /** The (model, upstream) whose prompt cache is warm for this conversation. */
   lastRoute?: { model: string; upstream: string } | null;
+  /** Upstream health: skip open circuits, prefer faster endpoints on cost ties. */
+  health?: { available(name: string): boolean; latencyMs(name: string): number };
 }
 
 /**
@@ -86,12 +88,15 @@ export interface RouteInputs {
  *    globally enabled. Never any format translation.
  */
 export function route(inputs: RouteInputs): RouteDecision {
-  const { body, dialect, home, upstreams, config, classification, lastRoute } = inputs;
+  const { body, dialect, home, upstreams, config, classification, lastRoute, health } = inputs;
   const escalationBoost = inputs.escalationBoost ?? 0;
   const requestedModel: string = body?.model ?? "";
   const auto = isAutoModel(requestedModel);
   const requested = auto ? undefined : getModel(requestedModel);
   const { complexity, taskType, confidence } = classification;
+  const tokens = estimateTokens(body);
+  const warm = (specId: string, upstreamName: string) =>
+    !!lastRoute && normalizeModelId(lastRoute.model) === normalizeModelId(specId) && lastRoute.upstream === upstreamName;
 
   const noop = (reason: string): RouteDecision => ({
     requestedModel,
@@ -104,7 +109,9 @@ export function route(inputs: RouteInputs): RouteDecision {
     auto,
     taskType,
     sticky: false,
-    estCostUsd: 0,
+    // Even a kept/passed-through model has an estimated cost — shadow-mode
+    // comparisons and eval need it.
+    estCostUsd: requested ? upstreams.estimateCostUsd(home, requested, tokens, warm(requested.id, home.name)) : 0,
     reason,
   });
 
@@ -123,7 +130,6 @@ export function route(inputs: RouteInputs): RouteDecision {
     requiredTier = clampTier(Math.max(requiredTier, requested.tier));
   }
 
-  const tokens = estimateTokens(body);
   const needsVision = requestNeedsVision(body);
   const usesTools = requestUsesTools(body);
   const familyProvider = requested?.provider ?? dialect;
@@ -137,9 +143,12 @@ export function route(inputs: RouteInputs): RouteDecision {
     (!needsVision || m.vision !== false) &&
     (!usesTools || m.toolUse !== false);
 
-  const servers = upstreams.list(dialect).filter((u) => u.name === home.name || upstreams.hasOwnAuth(u));
-  const warm = (spec: ModelSpec, u: UpstreamProvider) =>
-    !!lastRoute && normalizeModelId(lastRoute.model) === normalizeModelId(spec.id) && lastRoute.upstream === u.name;
+  const servers = upstreams
+    .list(dialect)
+    .filter((u) => u.name === home.name || upstreams.hasOwnAuth(u))
+    // Circuit breaker: skip upstreams that are currently failing — unless
+    // that would leave no candidates at all (fail open through home).
+    .filter((u, _, all) => health?.available(u.name) !== false || all.every((x) => health?.available(x.name) === false));
 
   const pairs: Array<{ spec: ModelSpec; upstream: UpstreamProvider; cost: number; warm: boolean }> = [];
   for (const spec of listModels()) {
@@ -149,13 +158,18 @@ export function route(inputs: RouteInputs): RouteDecision {
       // Vendor discipline: stay in the requested model's family unless this
       // upstream serves multiple vendors in one dialect (or global override).
       if (spec.provider !== familyProvider && !(globalCross || (u.crossProvider === true && dialect === "openai"))) continue;
-      const isWarm = warm(spec, u);
+      const isWarm = warm(spec.id, u.name);
       pairs.push({ spec, upstream: u, warm: isWarm, cost: upstreams.estimateCostUsd(u, spec, tokens, isWarm) });
     }
   }
-  pairs.sort(
-    (a, b) => a.cost - b.cost || Number(b.upstream.name === home.name) - Number(a.upstream.name === home.name),
-  );
+  pairs.sort((a, b) => {
+    // Costs within 2% are a tie: break by upstream latency, then home-first.
+    const tie = Math.abs(a.cost - b.cost) <= 0.02 * Math.max(a.cost, b.cost, 1e-9);
+    if (!tie) return a.cost - b.cost;
+    const lat = (health?.latencyMs(a.upstream.name) ?? 0) - (health?.latencyMs(b.upstream.name) ?? 0);
+    if (lat !== 0) return lat;
+    return Number(b.upstream.name === home.name) - Number(a.upstream.name === home.name);
+  });
 
   const pick = pairs[0];
   if (!pick || (requested && pick.spec.id === requested.id && pick.upstream.name === home.name)) {

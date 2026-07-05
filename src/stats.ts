@@ -27,7 +27,11 @@ export function createStats(dbPath: string): StatsStore {
       required_tier INTEGER NOT NULL DEFAULT 0,
       boost INTEGER NOT NULL DEFAULT 0,
       sticky INTEGER NOT NULL DEFAULT 0,
-      convo TEXT NOT NULL DEFAULT ''
+      convo TEXT NOT NULL DEFAULT '',
+      mount TEXT NOT NULL DEFAULT '',
+      est_cost REAL NOT NULL DEFAULT 0,
+      shadow_model TEXT NOT NULL DEFAULT '',
+      shadow_cost REAL NOT NULL DEFAULT 0
     )
   `);
 
@@ -38,8 +42,9 @@ export function createStats(dbPath: string): StatsStore {
     INSERT INTO requests (
       ts, provider, upstream, requested_model, routed_model, input_tokens, output_tokens,
       cost_actual, cost_baseline, saved_usd, cache_hit, downgraded, latency_ms,
-      task_type, complexity, required_tier, boost, sticky, convo
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      task_type, complexity, required_tier, boost, sticky, convo,
+      mount, est_cost, shadow_model, shadow_cost
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   return {
@@ -63,8 +68,19 @@ export function createStats(dbPath: string): StatsStore {
         rec.requiredTier,
         rec.escalationBoost,
         rec.sticky ? 1 : 0,
-        rec.conversation
+        rec.conversation,
+        rec.mount,
+        rec.estCostUsd,
+        rec.shadowModel,
+        rec.shadowCostUsd
       );
+    },
+
+    spendSince(ts: number, mount?: string): number {
+      const row = mount
+        ? (db.prepare(`SELECT SUM(cost_actual) AS s FROM requests WHERE ts >= ? AND mount = ?`).get(ts, mount) as { s: number | null })
+        : (db.prepare(`SELECT SUM(cost_actual) AS s FROM requests WHERE ts >= ?`).get(ts) as { s: number | null });
+      return row?.s ?? 0;
     },
 
     routerEval() {
@@ -105,10 +121,28 @@ export function createStats(dbPath: string): StatsStore {
         )
         .all() as any[];
 
+      const shadowRow = db
+        .prepare(
+          `SELECT COUNT(*) AS n,
+                  SUM(CASE WHEN shadow_model = routed_model THEN 1 ELSE 0 END) AS agree,
+                  SUM(shadow_cost - est_cost) AS delta
+           FROM requests WHERE shadow_model != ''`
+        )
+        .get() as { n: number; agree: number | null; delta: number | null };
+
       const total = totals.total || 0;
       const rate = (n: number | null) => (total > 0 ? (n ?? 0) / total : 0);
       return {
         totalDecisions: total,
+        ...(shadowRow.n > 0
+          ? {
+              shadow: {
+                decisions: shadowRow.n,
+                agreementRate: (shadowRow.agree ?? 0) / shadowRow.n,
+                estCostDeltaUsd: shadowRow.delta ?? 0,
+              },
+            }
+          : {}),
         downgradeRate: rate(totals.downgraded),
         stickyRate: rate(totals.sticky),
         escalationRate: rate(totals.escalated),

@@ -16,5 +16,27 @@ export function loadConfig(env: Record<string, string | undefined> = Bun.env): R
     crossProvider: env.ROUTER_CROSS_PROVIDER === "true",
     escalationEnabled: env.ESCALATION !== "false",
     strategy: env.ROUTER_STRATEGY === "llm" ? "llm" : "heuristic",
+    shadow:
+      env.SHADOW_MODE || env.SHADOW_STRATEGY
+        ? {
+            mode: (env.SHADOW_MODE as any) || undefined,
+            strategy: env.SHADOW_STRATEGY === "llm" ? "llm" : env.SHADOW_STRATEGY === "heuristic" ? "heuristic" : undefined,
+          }
+        : undefined,
+    budgets:
+      env.BUDGET_DAILY_USD || env.BUDGET_MONTHLY_USD
+        ? {
+            dailyUsd: env.BUDGET_DAILY_USD ? Number(env.BUDGET_DAILY_USD) : undefined,
+            monthlyUsd: env.BUDGET_MONTHLY_USD ? Number(env.BUDGET_MONTHLY_USD) : undefined,
+          }
+        : undefined,
+    calibration:
+      env.CALIBRATION === "true"
+        ? {
+            enabled: true,
+            sampleRate: env.CALIBRATION_SAMPLE ? Number(env.CALIBRATION_SAMPLE) : undefined,
+            apply: env.CALIBRATION_APPLY === "true",
+          }
+        : undefined,
   };
 }

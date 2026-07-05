@@ -3,6 +3,10 @@ import pkg from "../package.json" with { type: "json" };
 import { loadConfig } from "./config.ts";
 
 const arg = Bun.argv[2];
+if (arg === "setup") {
+  const { runSetup } = await import("./setup.ts");
+  process.exit(await runSetup(Bun.argv.slice(3)));
+}
 if (arg === "--version" || arg === "-v") {
   console.log(pkg.version);
   process.exit(0);
@@ -12,6 +16,7 @@ if (arg === "--help" || arg === "-h") {
 
 Usage:
   model-router                 start the proxy (config via env + router.config.json)
+  model-router setup <harness> print/apply harness config (claude-code, codex, opencode, copilot, pi)
   model-router --version       print version
   model-router --help          this help
 

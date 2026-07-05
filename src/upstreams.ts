@@ -1,5 +1,5 @@
 import { dirname, resolve } from "node:path";
-import type { CustomModelPricing, Dialect, ModelSpec, UpstreamAdapter, UpstreamProvider } from "./types.ts";
+import type { CustomModelPricing, Dialect, ModelSpec, RouterConfig, UpstreamAdapter, UpstreamProvider } from "./types.ts";
 import { getModel, globToRegex, normalizeModelId, registerModel, setModelAllowlist } from "./registry.ts";
 import { gatewayPricing, gatewayServes } from "./pricefeed.ts";
 
@@ -282,6 +282,9 @@ interface RouterFile {
   allowedModels?: string[];
   plugins?: string[];
   taskRules?: Array<{ pattern: string; tier: 1 | 2 | 3 | 4; taskType?: string }>;
+  budgets?: RouterConfig["budgets"];
+  shadow?: RouterConfig["shadow"];
+  calibration?: RouterConfig["calibration"];
 }
 
 export interface RouterSetup {
@@ -290,6 +293,9 @@ export interface RouterSetup {
   pluginPaths: string[];
   /** User task rules declared in the config file. */
   taskRules: Array<{ pattern: string; tier: 1 | 2 | 3 | 4; taskType?: string }>;
+  budgets?: RouterConfig["budgets"];
+  shadow?: RouterConfig["shadow"];
+  calibration?: RouterConfig["calibration"];
 }
 
 /** Guess the vendor for a custom-priced model id. */
@@ -385,6 +391,9 @@ export async function loadRouterSetup(
     upstreams: new Upstreams(declared, adapters),
     pluginPaths: fileConf.plugins ?? [],
     taskRules: fileConf.taskRules ?? [],
+    budgets: fileConf.budgets,
+    shadow: fileConf.shadow,
+    calibration: fileConf.calibration,
   };
 }
 

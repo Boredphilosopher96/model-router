@@ -15,6 +15,10 @@ import { createStats } from "./stats.ts";
 import { EscalationTracker, conversationKey } from "./escalation.ts";
 import { Upstreams, loadRouterSetup, resolveModulePath } from "./upstreams.ts";
 import { heuristicStrategy, llmStrategy, type RoutingStrategy } from "./strategy.ts";
+import { UpstreamHealth } from "./health.ts";
+import { BudgetGuard } from "./budget.ts";
+import { Calibrator, DEFAULT_CALIBRATION } from "./calibration.ts";
+import { lastUserText } from "./strategy.ts";
 // `with { type: "text" }` yields a string at runtime; @types/bun types *.html as HTMLBundle.
 import dashboardHtmlImport from "./dashboard/index.html" with { type: "text" };
 const dashboardHtml = dashboardHtmlImport as unknown as string;
@@ -26,6 +30,9 @@ export interface RouterServer {
   stats: StatsStore;
   upstreams: Upstreams;
   escalation: EscalationTracker;
+  health: UpstreamHealth;
+  budget: BudgetGuard;
+  calibration: Calibrator | null;
   stop(): void;
 }
 
@@ -49,32 +56,55 @@ export async function startServer(config: RouterConfig, plugins: PluginPipeline 
   // Routing strategy: fast multi-signal heuristic by default; optionally an
   // LLM classifier that asks a tier-1 model once per conversation.
   const heuristic = heuristicStrategy({ taskRules: [...setup.taskRules, ...(config.taskRules ?? [])] });
-  const classifierComplete = async (prompt: string): Promise<string> => {
+
+  /** One-shot completion on the cheapest authable model of at least `minTier`. */
+  const completeVia = async (minTier: number, prompt: string, maxTokens: number): Promise<string> => {
     const spec = listModels()
-      .filter((m) => m.tier === 1)
-      .sort((a, b) => a.inputPer1M - b.inputPer1M)[0];
-    if (!spec) throw new Error("no tier-1 model available for classification");
+      .filter((m) => m.tier >= minTier)
+      .sort((a, b) => a.tier - b.tier || a.inputPer1M - b.inputPer1M)
+      .find((m) => upstreams.list(m.provider).some((x) => upstreams.hasOwnAuth(x)));
+    if (!spec) throw new Error(`no authable model of tier >= ${minTier} available`);
     const dialect: Dialect = spec.provider;
-    const u = upstreams.list(dialect).find((x) => upstreams.hasOwnAuth(x));
-    if (!u) throw new Error(`no authable ${dialect} upstream for classification`);
-    const body =
-      dialect === "anthropic"
-        ? { model: spec.id, max_tokens: 40, messages: [{ role: "user", content: prompt }] }
-        : { model: spec.id, max_tokens: 40, messages: [{ role: "user", content: prompt }] };
+    const u = upstreams.list(dialect).find((x) => upstreams.hasOwnAuth(x))!;
     const path = dialect === "anthropic" ? "/v1/messages" : "/v1/chat/completions";
     const resp = await fetch(upstreams.url(u, path), {
       method: "POST",
       headers: upstreams.headers(u, dialect, new Headers(), false),
-      body: JSON.stringify(body),
+      body: JSON.stringify({ model: spec.id, max_tokens: maxTokens, messages: [{ role: "user", content: prompt }] }),
     });
-    if (!resp.ok) throw new Error(`classifier upstream ${resp.status}`);
+    if (!resp.ok) throw new Error(`upstream ${resp.status}`);
     const json: any = await resp.json();
     return dialect === "anthropic"
       ? (json?.content?.find((b: any) => b.type === "text")?.text ?? "")
       : (json?.choices?.[0]?.message?.content ?? "");
   };
+  const classifierComplete = (prompt: string) => completeVia(1, prompt, 40);
   const strategy: RoutingStrategy =
     config.strategy === "llm" ? llmStrategy(classifierComplete, heuristic) : heuristic;
+
+  // Shadow mode: evaluate an alternative mode/strategy without applying it.
+  const shadowConf = config.shadow ?? setup.shadow;
+  const shadowStrategy: RoutingStrategy | null = shadowConf?.strategy
+    ? shadowConf.strategy === "llm"
+      ? llmStrategy(classifierComplete, heuristic)
+      : heuristic
+    : null;
+
+  // Upstream health (circuit breaker + latency) and spend budgets.
+  const health = new UpstreamHealth();
+  const budget = new BudgetGuard(stats, config.budgets ?? setup.budgets ?? {});
+
+  // Quality calibration: grade sampled downgraded responses on a frontier model.
+  const calConf = config.calibration ?? setup.calibration;
+  const calibration =
+    calConf?.enabled
+      ? new Calibrator(config.dbPath, (prompt) => completeVia(3, prompt, 60), {
+          ...DEFAULT_CALIBRATION,
+          sampleRate: calConf.sampleRate ?? DEFAULT_CALIBRATION.sampleRate,
+          apply: calConf.apply ?? DEFAULT_CALIBRATION.apply,
+          gradeIntervalMs: calConf.gradeIntervalMs ?? DEFAULT_CALIBRATION.gradeIntervalMs,
+        })
+      : null;
 
   // Header values must be ISO-8859-1 safe; model ids and reasons are user-influenced.
   const headerSafe = (s: string) => s.replace(/[^\x20-\x7e]/g, "?").slice(0, 500);
@@ -104,17 +134,54 @@ export async function startServer(config: RouterConfig, plugins: PluginPipeline 
     const convo = conversationKey(dialect, body);
     const boost = config.escalationEnabled === false ? 0 : escalation.observeRequest(convo, body);
 
-    const classification = await strategy.classify(body, convo);
+    let classification = await strategy.classify(body, convo);
+    // Calibration: measured inadequacy of a task type raises its tier.
+    const calBoost = calibration?.tierBoost(classification.taskType) ?? 0;
+    if (calBoost > 0) {
+      classification = {
+        ...classification,
+        requiredTier: Math.min(classification.requiredTier + calBoost, 4) as 1 | 2 | 3 | 4,
+        reasons: [...classification.reasons, `calibration +${calBoost} (measured inadequacy)`],
+      };
+    }
+    // Budgets: tighten the mode as spend windows deplete.
+    const budgeted = budget.enabled ? budget.effectiveMode(config.mode, home.name) : { mode: config.mode, usage: 0, binding: "none" };
+    const effectiveConfig = { mode: budgeted.mode, crossProvider: config.crossProvider };
+
     let decision = route({
       body,
       dialect,
       home,
       upstreams,
-      config,
+      config: effectiveConfig,
       classification,
       escalationBoost: boost,
       lastRoute: escalation.lastRoute(convo),
+      health,
     });
+
+    // Shadow decision: same request through the alternative config — recorded,
+    // never applied.
+    let shadow: { model: string; cost: number } | null = null;
+    if (shadowConf && (shadowConf.mode || shadowConf.strategy)) {
+      try {
+        const shadowClass = shadowStrategy ? await shadowStrategy.classify(body, convo) : classification;
+        const sd = route({
+          body,
+          dialect,
+          home,
+          upstreams,
+          config: { mode: shadowConf.mode ?? config.mode, crossProvider: config.crossProvider },
+          classification: shadowClass,
+          escalationBoost: boost,
+          lastRoute: escalation.lastRoute(convo),
+          health,
+        });
+        shadow = { model: sd.routedModel, cost: sd.estCostUsd };
+      } catch (err) {
+        console.error("[shadow] evaluation failed:", err);
+      }
+    }
     decision = await plugins.runRouteDecision(decision, body, ctx);
     ctx.routedModel = decision.routedModel;
     ctx.taskType = decision.taskType;
@@ -135,6 +202,9 @@ export async function startServer(config: RouterConfig, plugins: PluginPipeline 
     if (decision.escalationBoost > 0) routerHeaders["x-router-escalation"] = String(decision.escalationBoost);
     if (decision.sticky) routerHeaders["x-router-sticky"] = "1";
     routerHeaders["x-router-task"] = headerSafe(decision.taskType);
+    if (budget.enabled) routerHeaders["x-router-budget-used"] = budgeted.usage.toFixed(3);
+    if (budgeted.mode !== config.mode) routerHeaders["x-router-mode"] = budgeted.mode;
+    if (shadow) routerHeaders["x-router-shadow-model"] = headerSafe(shadow.model);
 
     const record = (usage: { inputTokens: number; outputTokens: number }, cacheHit: boolean, latencyMs: number) => {
       const costActual = cacheHit || !routedSpec ? 0 : upstreams.costUsd(target, routedSpec, usage.inputTokens, usage.outputTokens);
@@ -161,6 +231,10 @@ export async function startServer(config: RouterConfig, plugins: PluginPipeline 
         escalationBoost: decision.escalationBoost,
         sticky: decision.sticky,
         conversation: convo,
+        mount: home.name,
+        estCostUsd: decision.estCostUsd,
+        shadowModel: shadow?.model ?? "",
+        shadowCostUsd: shadow?.cost ?? 0,
       };
       plugins.runRecord(rec, ctx).finally(() => {
         try {
@@ -196,9 +270,11 @@ export async function startServer(config: RouterConfig, plugins: PluginPipeline 
       });
     } catch (err) {
       escalation.observeOutcome(convo, "failure");
+      health.note(target.name, false, performance.now() - t0);
       return Response.json({ error: `upstream unreachable: ${String(err)}` }, { status: 502 });
     }
 
+    health.note(target.name, !(upstream.status === 429 || upstream.status >= 500), performance.now() - t0);
     if (!upstream.ok) {
       if (upstream.status === 429 || upstream.status >= 500) escalation.observeOutcome(convo, "failure");
       // Pass provider errors through untouched so the harness sees the real failure.
@@ -242,6 +318,19 @@ export async function startServer(config: RouterConfig, plugins: PluginPipeline 
       } catch (err) {
         console.error("[cache] failed to store response:", err);
       }
+    }
+    if (calibration && decision.routedModel !== decision.requestedModel && !decision.auto) {
+      const responseText =
+        dialect === "anthropic"
+          ? (json?.content ?? []).map((b: any) => b?.text ?? "").join("\n")
+          : (json?.choices?.[0]?.message?.content ?? json?.output_text ?? "");
+      calibration.maybeSample({
+        taskType: decision.taskType,
+        requiredTier: decision.requiredTier,
+        routedModel: decision.routedModel,
+        prompt: lastUserText(body),
+        response: String(responseText ?? ""),
+      });
     }
     json = await plugins.runResponse(json, ctx);
     // Harness-blind: report the model the caller asked for; truth is in headers.
@@ -328,6 +417,10 @@ export async function startServer(config: RouterConfig, plugins: PluginPipeline 
         return Response.json(upstreams.list().map(({ name, baseUrl, dialect: d, models, priceMultiplier }) => ({ name, baseUrl, dialect: d, models, priceMultiplier })));
       if (pathname === "/api/escalations") return Response.json(escalation.snapshot());
       if (pathname === "/api/router-eval") return Response.json(stats.routerEval());
+      if (pathname === "/api/upstream-health") return Response.json(health.snapshot());
+      if (pathname === "/api/budget") return Response.json(budget.snapshot(upstreams.list().map((u) => u.name)));
+      if (pathname === "/api/calibration")
+        return Response.json(calibration ? calibration.snapshot() : { enabled: false });
       if (pathname === "/api/plugins") return Response.json(plugins.list());
       if (pathname === "/health")
         return Response.json({
@@ -341,7 +434,21 @@ export async function startServer(config: RouterConfig, plugins: PluginPipeline 
     },
   });
 
-  return { server, plugins, cache, stats, upstreams, escalation, stop: () => server.stop(true) };
+  return {
+    server,
+    plugins,
+    cache,
+    stats,
+    upstreams,
+    escalation,
+    health,
+    budget,
+    calibration,
+    stop: () => {
+      calibration?.stop();
+      server.stop(true);
+    },
+  };
 }
 
 /** Parse token usage out of an accumulated SSE stream body. */

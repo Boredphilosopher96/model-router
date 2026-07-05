@@ -206,6 +206,13 @@ export interface RequestRecord {
   sticky: boolean;
   /** Conversation fingerprint — lets the evaluator link decisions to later escalations. */
   conversation: string;
+  /** Home mount the request arrived on (for per-mount budgets). */
+  mount: string;
+  /** The router's cost estimate for the applied decision, USD. */
+  estCostUsd: number;
+  /** Shadow-mode counterfactual (empty when shadow mode is off). */
+  shadowModel: string;
+  shadowCostUsd: number;
 }
 
 /** Aggregate stats served to the dashboard at /api/stats. */
@@ -265,6 +272,14 @@ export interface RouterEval {
    * router's misjudgment signal. High regret => routing too aggressively.
    */
   regretRate: number;
+  /** Shadow-mode comparison (present when shadow decisions have been recorded). */
+  shadow?: {
+    decisions: number;
+    /** Share of requests where the shadow config picked the same model. */
+    agreementRate: number;
+    /** SUM(shadow est cost - applied est cost), USD. Negative = shadow config would have been cheaper. */
+    estCostDeltaUsd: number;
+  };
   byTaskType: Array<{
     taskType: string;
     requests: number;
@@ -282,6 +297,16 @@ export interface StatsStore {
   record(rec: RequestRecord): void;
   summary(): StatsSummary;
   routerEval(): RouterEval;
+  /** Actual spend (USD) recorded since `ts`, optionally scoped to one mount. */
+  spendSince(ts: number, mount?: string): number;
+}
+
+/** Spend caps, USD. As a window's budget depletes, routing gets stricter. */
+export interface BudgetConfig {
+  dailyUsd?: number;
+  monthlyUsd?: number;
+  /** Per-mount daily caps, keyed by upstream/mount name. */
+  perMountDailyUsd?: Record<string, number>;
 }
 
 export interface RouterConfig {
@@ -323,6 +348,27 @@ export interface RouterConfig {
    * conversation once; falls back to heuristic on error/timeout).
    */
   strategy?: "heuristic" | "llm";
+  /**
+   * Shadow mode: evaluate an alternative mode/strategy on every request
+   * WITHOUT applying it, and record the counterfactual for comparison at
+   * /api/router-eval. Risk-free strategy A/B on real traffic.
+   */
+  shadow?: { mode?: "aggressive" | "balanced" | "quality" | "off"; strategy?: "heuristic" | "llm" };
+  /** Spend caps that tighten routing as they deplete. */
+  budgets?: BudgetConfig;
+  /**
+   * Quality calibration: sample downgraded responses, have a frontier model
+   * grade adequacy offline, and surface (or apply) per-task tier corrections.
+   */
+  calibration?: {
+    enabled?: boolean;
+    /** Sampling probability for downgraded, non-streaming responses. Default 0.05. */
+    sampleRate?: number;
+    /** Apply recommended +1 tier corrections automatically. Default false (advisory). */
+    apply?: boolean;
+    /** Grading pass interval. Default 6h; 0 disables the timer. */
+    gradeIntervalMs?: number;
+  };
   /**
    * User-defined task rules evaluated before built-in classification:
    * first match wins. Patterns are case-insensitive regexes tested against

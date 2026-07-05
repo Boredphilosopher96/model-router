@@ -17,9 +17,11 @@ model-router is configured through environment variables (runtime behavior) and 
 | `BUDGET_DAILY_USD` | — | Daily spend limit. Routing tightens as daily budget fills: <70% unchanged, 70-90% one notch stricter, >=90% aggressive. Never blocks. |
 | `BUDGET_MONTHLY_USD` | — | Monthly spend limit. Same tightening behavior as daily. |
 | `ESCALATION` | `true` | Per-conversation stuck detection and tier bumping. |
-| `CACHE_ENABLED` | `true` | Response cache for non-streaming requests. |
+| `FAILOVER` | `true` | Automatic failover: retry retryable errors (429, 5xx, unreachable) on up to two next-best (model, upstream) pairs before surfacing; safe for streaming (failures surface at headers before body bytes reach client). |
+| `CACHE_ENABLED` | `true` | Response cache for both streaming and non-streaming requests. Streaming responses cached as raw SSE, replayed byte-for-byte on identical requests (x-router-cache: hit); streams over 2MB not cached; stream and non-stream variants cached separately. |
+| `CACHE_NORMALIZE` | `true` | Normalize volatile bytes (ISO timestamps, bare dates, 13-digit epoch millis, UUIDs, long hex ids) out of the cache key, so near-identical requests hit the cache. The request itself is never modified; only the hash input is. |
 | `CACHE_TTL_MS` | `3600000` | Cache entry lifetime (1 hour). |
-| `DB_PATH` | `model-router.sqlite` | SQLite file backing the cache and stats. |
+| `DB_PATH` | `model-router.sqlite` | SQLite file backing the cache, stats, conversation state, and escalation tracking. Escalation boosts and warm-prompt-cache mapping (which model last served each conversation) persist across restarts, eliminating cache-blowing model switches. Conversations idle past the 30-minute TTL are purged at startup. |
 | `PRICE_AUTOUPDATE` | `true` | Daily model/price refresh from the live feed. |
 | `PRICE_REFRESH_MS` | `86400000` | Refresh interval; `0` = refresh at startup only. |
 | `PRICE_FEED_URL` | LiteLLM raw JSON | Alternative feed URL (must use the same schema). |
@@ -30,6 +32,7 @@ model-router is configured through environment variables (runtime behavior) and 
 | `CALIBRATION_APPLY` | `false` | Automatically apply tier recommendations from calibration. If false, recommendations appear in `/api/calibration` only. |
 | `PLUGIN_LOGGER` | `true` | Bundled request/latency logging plugin. |
 | `PLUGIN_TOON` | `false` | Bundled JSON→TOON prompt-compression plugin. |
+| `PLUGIN_PRUNE` | `false` | Bundled context-pruning plugin. Truncates oversized tool_result blocks in old turns of very long conversations (history > 30k tokens); cache-aware (respects warm-provider cache by default in "whenCold" mode, "always" mode overrides). See `docs/extending.md` for configuration options. |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | — | Fallback credentials for the default direct-API upstreams. |
 
 ## `router.config.json`

@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-07-05
+
+### Added
+
+- **Automatic failover** — retryable upstream errors (429, 5xx, unreachable) are retried on up to two next-best (model, upstream) pairs before surfacing; safe for streaming because failures surface at response headers before body bytes reach the client; response header `x-router-failover: <n>` marks which attempt served; disable with `FAILOVER=false`.
+- **Rate-limit awareness** — provider rate-limit headers (anthropic-ratelimit-* and x-ratelimit-*) parsed on every response; upstreams reporting < 5% budget remaining are soft-throttled for 30 seconds (deprioritized like open circuit, still fail-open); `/api/upstream-health` entries now include `rateRemaining` and `throttled` fields.
+- **Streaming cache replay** — streaming responses are now cached as raw SSE and replayed byte-for-byte on identical requests with `x-router-cache: hit`; streams over 2 MB not cached; stream and non-stream variants cached separately; calibration now samples streamed responses by reassembling text from SSE deltas.
+- **Cache normalization** (default on, `CACHE_NORMALIZE=false` to disable) — volatile bytes (ISO timestamps, bare dates, 13-digit epoch millis, UUIDs, long hex ids) normalized out of the cache key so near-identical requests hit the cache; the request itself is never modified, only the hash input.
+- **Persistent conversation state** — escalation boosts and warm-prompt-cache mapping (which model last served each conversation) now persist in the SQLite file (DB_PATH), so a proxy restart no longer causes cache-blowing model switches; conversations idle past the 30-minute TTL are purged at startup.
+- **Context pruning plugin** (opt-in via `PLUGIN_PRUNE=true` or `prunePlugin()` in config/library) — truncates oversized `tool_result` blocks in old turns of very long conversations (history > 30k tokens); cache-aware: by default ("whenCold" mode) only prunes when the conversation has no warm provider cache to lose, avoiding expensive cold re-reads; "always" mode overrides; options include minHistoryTokens, keepRecentTurns, maxToolResultChars, mode.
+- **Content-aware token estimation** — replaces chars/4 approximation with single-pass estimator: CJK ~1 char/token, structural/code characters ~1.5 chars/token, prose ~4.2; improves cost estimates, stay-vs-switch math, and context-fit checks; exported as `estimateTextTokens` and `estimateValueTokens` from library API.
+- **New environment variables** — `FAILOVER` (default true), `CACHE_NORMALIZE` (default true), `PLUGIN_PRUNE` (default false).
+
+### Changed
+
+- **Response cache** — now caches both streaming and non-streaming responses; streaming caching requires careful monitoring of memory usage for high-throughput proxies.
+- **Escalation signal deduplication** — escalation now counts at most ONE failure signal per request (only when every candidate fails); per-upstream penalties go to the health tracker instead, preventing multi-count against a single request's retries.
+
+### Fixed
+
+- **Escalation no longer multi-counts a single request's upstream retries** — with failover enabled, a single request may be retried across multiple upstreams; only the final failure (if all candidates fail) counts toward escalation, not each individual retry.
+
 ## [1.2.0] - 2026-07-05
 
 ### Added

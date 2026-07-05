@@ -96,7 +96,7 @@ All hooks from composed plugins run in the order registered, wrapped by the matc
    await startServer(loadConfig(), new PluginPipeline().use(plugin));
    ```
 
-3. **Bundled plugins** via env: `PLUGIN_LOGGER` (default on), `PLUGIN_TOON` (JSON→TOON prompt compression, default off).
+3. **Bundled plugins** via env: `PLUGIN_LOGGER` (default on), `PLUGIN_TOON` (JSON→TOON prompt compression, default off), `PLUGIN_PRUNE` (context pruning, default off).
 
 **Use cases that map cleanly onto hooks:** per-tenant model pinning and budget caps (`onRouteDecision`), prompt compression and secret redaction (`onRequest`), response post-processing (`onResponse`), metrics/alerting/chargeback export (`onRecord`).
 
@@ -136,6 +136,54 @@ export default adapter;
 ```
 
 Only the hooks you define run; every other upstream stays stock. Template: `examples/adapters/mygateway.ts`.
+
+## Bundled plugins
+
+### Context pruning plugin (prunePlugin)
+
+When enabled via `PLUGIN_PRUNE=true` or by calling `prunePlugin()` in config/library, the context pruning plugin truncates oversized `tool_result` blocks in old turns of very long conversations (history > 30k tokens). This reduces token overhead and latency for deeply agentic workflows while preserving the most recent turns.
+
+**Options:**
+
+| Option | Default | Description |
+|---|---|---|
+| `minHistoryTokens` | `30000` | Minimum conversation history tokens to trigger pruning. |
+| `keepRecentTurns` | `8` | Number of most recent turns (user + assistant pairs) to preserve; never pruned. |
+| `maxToolResultChars` | `1500` | Maximum character length for a `tool_result` block before truncation. Longer blocks in old turns are truncated to this length. |
+| `mode` | `"whenCold"` | Pruning strategy: `"whenCold"` (default) only prunes when the conversation has no warm provider cache to lose — with a warm cache, history bills at ~10% and pruning would force a full cold re-read that usually costs more. `"always"` overrides, pruning regardless. |
+
+**How it works:**
+
+The plugin reads `ctx.state["model-router:lastRoute"]` — the (model, upstream) whose provider prompt cache is warm for this conversation, injected by the proxy before plugins run. When `mode: "whenCold"`, pruning happens only when that state is empty (no warm cache exists — a fresh conversation, or one whose cache was already lost). With a warm cache, history bills at ~10% of the input rate, and editing any turn would invalidate the cached prefix and force a full-price re-read — usually costing more than the pruning saves.
+
+Enable via environment:
+```sh
+PLUGIN_PRUNE=true
+```
+
+Or via config with options:
+```jsonc
+{
+  "plugins": [
+    {
+      "name": "context-pruner",
+      "module": "@curliness8029/model-router/plugins/prune",
+      "options": {
+        "minHistoryTokens": 30000,
+        "keepRecentTurns": 8,
+        "maxToolResultChars": 1500,
+        "mode": "whenCold"
+      }
+    }
+  ]
+}
+```
+
+Or via library API:
+```ts
+import { prunePlugin } from "@curliness8029/model-router";
+pipeline.use(prunePlugin({ mode: "always" }));
+```
 
 ## Custom models and pricing
 

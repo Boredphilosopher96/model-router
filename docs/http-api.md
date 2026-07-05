@@ -36,7 +36,8 @@ Every response includes router metadata in HTTP headers:
 | `x-router-upstream` | Upstream name the request went to |
 | `x-router-reason` | Why the router made this choice (e.g., "cheapest capable", "escalation boost", "context limit") |
 | `x-router-escalation` | (Present only if escalation applied) tier boost count |
-| `x-router-cache` | `"hit"`, `"miss"`, or `"bypass"` (streaming always bypasses) |
+| `x-router-failover` | (Present only when a retry served the response) Which alternate served: 1 = first alternate, 2 = second. Absent when the originally chosen pair succeeded |
+| `x-router-cache` | `"hit"`, `"miss"`, or `"bypass"` for non-streaming requests; `"hit"` or `"miss"` for streaming (streaming responses are now cached raw SSE) |
 | `x-router-budget-used` | (Present if budgets configured) Fraction 0–1 of the most-constrained budget window filled |
 | `x-router-mode` | (Present if budget tightening applied) Effective mode after budget constraint |
 | `x-router-shadow-model` | (Present if shadow mode enabled) Model the shadow config would have chosen |
@@ -233,14 +234,18 @@ Returns circuit breaker and latency status per upstream:
     "latencyMs": 245,
     "ok": true,
     "failed": 0,
-    "circuit": "closed"
+    "circuit": "closed",
+    "rateRemaining": 0.95,
+    "throttled": false
   },
   {
     "upstream": "copilot",
     "latencyMs": 310,
     "ok": false,
     "failed": 4,
-    "circuit": "half-open"
+    "circuit": "half-open",
+    "rateRemaining": 0.03,
+    "throttled": true
   }
 ]
 ```
@@ -250,6 +255,8 @@ Fields:
 - `ok` — upstream is reachable and within limits.
 - `failed` — failure count in the current window (resets on recovery).
 - `circuit` — `"closed"` (normal), `"open"` (throttled), or `"half-open"` (recovery probe pending).
+- `rateRemaining` — fraction 0–1 of the upstream's request/token budget remaining (parsed from provider rate-limit headers).
+- `throttled` — bool; true when `rateRemaining < 0.05`, soft-throttling for 30 seconds.
 
 ### Quality calibration
 
@@ -354,7 +361,7 @@ All other `/v1/*` paths (e.g., `/v1/messages/count_tokens`, `/v1/embeddings`) ar
 Streaming requests (`{"stream": true}`) receive byte-for-byte SSE passthrough from the upstream. The router:
 
 - Tees the response stream to extract token usage for stats (parsed from `finish_reason`, `usage` fields in server-sent events).
-- Never caches streaming responses.
+- Caches streaming responses as raw SSE, replayed byte-for-byte on identical requests (x-router-cache: hit with content-type text/event-stream); streams over 2 MB not cached; stream and non-stream variants cached separately.
 - Preserves all upstream SSE formatting and timing.
 - Does NOT rewrite the `model` field inside stream events; the truth is in the `x-router-routed-model` header.
 

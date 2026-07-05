@@ -74,6 +74,8 @@ Staying on the "expensive" model is half the price, so the router sticks (`stick
 
 Ties prefer the home upstream. The winner's model id is written in the form that upstream expects (namespace style preserved, `vendorPrefix` applied).
 
+**Streaming caching:** Streaming responses are cached as raw SSE and replayed byte-for-byte on identical requests, with `x-router-cache: hit` on the response headers. Streams over 2 MB are not cached. Stream and non-stream variants of a request are cached separately. Calibration now samples streamed responses too, reassembling text from SSE deltas for adequacy grading.
+
 ## 7. Escalation — bumping when stuck
 
 The tracker keys conversations by a stable fingerprint (system prompt + first user turn), so a growing conversation keeps its identity across requests. Signals that a conversation is struggling:
@@ -82,7 +84,7 @@ The tracker keys conversations by a stable fingerprint (system prompt + first us
 - `is_error: true` tool results flowing back in (the model's tool calls are failing),
 - loop suspicion: a deep conversation re-entering rapidly without growing.
 
-Every 3 signals add +1 tier boost (max +2 by default); 4 clean responses remove one level; idle conversations are forgotten after 30 minutes. A boost raises the tier floor *and* ceiling, so a conversation stuck on a tier-1 model can be bumped to tier 2 or 3 even though it asked for the tier-1 model. Active boosts are visible at `GET /api/escalations` and on responses as `x-router-escalation`.
+Every 3 signals add +1 tier boost (max +2 by default); 4 clean responses remove one level; idle conversations are forgotten after 30 minutes. A boost raises the tier floor *and* ceiling, so a conversation stuck on a tier-1 model can be bumped to tier 2 or 3 even though it asked for the tier-1 model. Active boosts are visible at `GET /api/escalations` and on responses as `x-router-escalation`. Escalation boosts and the warm-prompt-cache mapping (which model last served each conversation) persist in the SQLite file (DB_PATH), so a proxy restart no longer causes cache-blowing model switches.
 
 ## 8. Shadow mode — safe strategy validation
 
@@ -96,7 +98,17 @@ Run a strategy change on real traffic before committing to it:
 
 Response header `x-router-shadow-model` shows the shadow's model choice per request.
 
-## 9. Budgets — automatic spend control
+## 9. Failover — automatic retry on transient errors
+
+When an upstream returns a retryable error (429 rate-limit, 5xx server error, or is unreachable), the router automatically retries the request on up to two next-best (model, upstream) candidate pairs before surfacing the error to the client.
+
+Failover is safe for streaming: failures are detected at the response headers stage, before any bytes reach the client body. A stream that fails mid-body is not retried (the failure is already exposed). Response header `x-router-failover: <n>` is present only when an alternate served the response (1 = first alternate, 2 = second); it is absent when the originally chosen pair succeeded. Escalation counts at most ONE failure signal per request, only when every candidate fails — per-upstream penalties go to the health tracker instead. Disable with `FAILOVER=false`.
+
+## 10. Rate-limit awareness
+
+The router parses provider rate-limit headers on every response (anthropic-ratelimit-* and x-ratelimit-*). When an upstream reports less than 5% of its request or token budget remaining, it is soft-throttled for 30 seconds — deprioritized like an open circuit, still fail-open (traffic routes anyway if all other candidates are exhausted). Upstream health at `GET /api/upstream-health` includes `rateRemaining` (0–1 fraction of budget left) and `throttled` (bool) per upstream.
+
+## 11. Budgets — automatic spend control
 
 Declare daily, monthly, or per-upstream daily limits in `router.config.json` under `budgets`. As the most-depleted window fills, the router tightens the mode:
 
@@ -106,13 +118,13 @@ Declare daily, monthly, or per-upstream daily limits in `router.config.json` und
 
 Mode `off` is never overridden. Traffic is never blocked — only routing mode tightens. Response headers `x-router-budget-used` (fraction) and `x-router-mode` (if tightened) track the constraint. Query `GET /api/budget` for current spend vs. limits.
 
-## 10. Upstream health — circuit breaker and latency tie-break
+## 12. Upstream health — circuit breaker and latency tie-break
 
 Each upstream is monitored for latency (EWMA) and failure rate. When an upstream receives 5 failures in 60 seconds, its circuit opens for 30 seconds; a half-open probe tests recovery. Open-circuit upstreams are skipped during pair selection (unless all candidates are exhausted — fail-open).
 
 When two (model, upstream) pairs have costs within 2% of each other, the lower-latency upstream wins the pair, then home upstream breaks ties. Upstream health is observable at `GET /api/upstream-health`.
 
-## 11. Quality calibration — measure, grade, recommend, apply
+## 13. Quality calibration — measure, grade, recommend, apply
 
 Continuous measurement of downgrade adequacy over time:
 
@@ -123,7 +135,7 @@ Continuous measurement of downgrade adequacy over time:
 
 Calibration never blocks or delays live requests (sampling is post-response, grading runs in the background). It complements `regretRate` metrics to tune downgrade strategy over time.
 
-## 12. Fail-open guarantees
+## 14. Fail-open guarantees
 
 The router never blocks traffic it doesn't understand:
 

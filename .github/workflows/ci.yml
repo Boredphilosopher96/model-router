@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test & typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck (strict)
+        run: bunx tsc --noEmit
+
+      - name: Test
+        run: bun test
+
+      - name: Boot smoke test
+        run: |
+          PORT=4141 DB_PATH=/tmp/ci.sqlite PRICE_AUTOUPDATE=false \
+            ROUTER_CONFIG=router.config.example.json timeout 5 bun run src/cli.ts &
+          sleep 2
+          curl -sf http://localhost:4141/health | grep -q '"ok":true'
+          curl -sf -o /dev/null http://localhost:4141/dashboard
+          echo "boot smoke OK"

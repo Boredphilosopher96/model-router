@@ -1,0 +1,55 @@
+name: Publish to npm
+
+# Publishes when a GitHub release is published (recommended flow:
+# bump package.json version -> update CHANGELOG.md -> create a release
+# tagged vX.Y.Z). Requires the NPM_TOKEN repository secret (an npm
+# automation token). Provenance attestation is enabled via OIDC.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # npm provenance
+
+jobs:
+  publish:
+    name: Verify & publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # npm CLI (for publish + provenance) comes from Node
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck (strict)
+        run: bunx tsc --noEmit
+
+      - name: Test
+        run: bun test
+
+      - name: Check version matches tag
+        if: github.event_name == 'release'
+        run: |
+          PKG_VERSION=$(bun -e 'console.log((await Bun.file("package.json").json()).version)')
+          TAG="${{ github.event.release.tag_name }}"
+          if [ "v$PKG_VERSION" != "$TAG" ]; then
+            echo "package.json version ($PKG_VERSION) does not match release tag ($TAG)"; exit 1
+          fi
+
+      - name: Publish
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

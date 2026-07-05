@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-07-05
+
+### Added
+
+- **Shadow mode** — run an alternative routing mode and/or strategy on real traffic without applying it; compare decision agreement and estimated cost delta via `GET /api/router-eval` before switching live; response header `x-router-shadow-model` reveals the shadow's model choice per request.
+- **Budgets** — declare daily, monthly, and per-upstream daily spend limits in config; routing mode tightens automatically as the most-constrained window fills (<70% unchanged, 70-90% one notch tighter, >=90% aggressive); never blocks traffic; observable at `GET /api/budget` and `x-router-budget-used` / `x-router-mode` headers.
+- **Upstream health monitoring** — per-upstream circuit breaker (opens after 5 failures in 60s, half-open probe for recovery) and EWMA latency tracking; open-circuit upstreams skipped unless all candidates exhausted (fail-open); when two candidates cost within 2%, lower-latency upstream wins; status at `GET /api/upstream-health`.
+- **Quality calibration** — continuous measurement of downgrade adequacy; samples downgraded non-streaming responses at a configurable rate; background grading by frontier-tier model; per-task type +1 tier recommendation when adequacy < 0.8 with >=5 samples; apply automatically (if enabled) or inspect at `GET /api/calibration`.
+- **`model-router setup` command** — `model-router setup <harness> [--write]` prints exact harness configuration or applies it automatically (--write merges `./opencode.json` and appends to `~/.codex/config.toml` with backups); supports claude-code, codex, opencode, copilot, pi.
+
+### Changed
+
+- **New response headers** — `x-router-budget-used`, `x-router-mode` (when budget-tightened), `x-router-shadow-model` (when shadow enabled).
+- **Documentation** — new sections in `docs/routing.md` for shadow mode, budgets, upstream health, and quality calibration; expanded `docs/configuration.md` with config sections and env vars for all five features; added observability endpoints in `docs/http-api.md`; new "One-command setup" section in `docs/harnesses.md`.
+
 ## [1.1.0] - 2026-07-05
 
 ### Added

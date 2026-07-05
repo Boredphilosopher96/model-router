@@ -27,11 +27,17 @@ Coding agents default to expensive frontier models for every request — includi
 - **Cache-aware stickiness.** When a conversation has warm cache on an expensive model, staying put costs less than switching to a cheaper model cold. The router knows the difference and sticks only when it saves money — switching frequently for short tasks, staying put for long ones. Sticky decisions are labeled in headers.
 - **Quality mode** — refuses downgrade when classifier confidence < 0.65, for workflows where "wrong answer faster" loses money.
 - **Escalates when stuck.** Repeated failures, erroring tool calls, or retry loops bump that conversation up a tier — even above the model it asked for — then decay back after sustained success.
+- **Shadow mode.** Run an alternative routing strategy on real traffic without applying it; compare agreement rate and estimated cost delta before switching live.
+- **Budgets.** Daily, monthly, and per-upstream spend limits that tighten routing mode (aggressive → balanced → quality) as limits fill, never blocking traffic.
+- **Upstream health.** Circuit breaker (opens after 5 failures in 60s) and latency-based tie-breaking; open-circuit upstreams skipped unless all candidates exhausted.
+- **Quality calibration.** Continuous measurement of downgraded request adequacy; per-task type +1 tier recommendations when adequacy drops below 0.8.
 - **Presets for fast setup.** Declare providers by name (`"providers": ["anthropic", {"name":"copilot","preset":"github-copilot"}]`), inheriting defaults from built-in presets (Anthropic, OpenAI, GitHub Copilot, GitHub Models, OpenRouter).
+- **One-command harness setup.** Run `model-router setup <harness> [--write]` to print or apply router config for Claude Code, Codex CLI, opencode, GitHub Copilot, or other tools.
 - **Router performance dashboard.** Live metrics on downgrade rate, sticky rate, escalation rate, regret rate (downgraded conversations that later escalated — the router's misjudgment signal), breakdowns by task type, and tier distribution for tuning.
 - **Never gets stale.** The model catalog, prices, capability flags, and gateway availability refresh daily from a maintained feed. GitHub Copilot prices via AI credits at per-token rates. New model generations automatically supersede old ones. Zero manual updates.
 - **Never gets in the way.** Unknown models, unparseable requests, feed outages, broken plugins — everything fails open and passes through. Provider errors reach your harness untouched.
 - **Proves the savings.** Every request is logged with actual cost vs. what the requested model would have cost, on a live dashboard.
+- **Self-tuning and spend-safe.** Budgets + shadow mode + quality calibration make the router self-optimizing: measure continuously, validate changes safely, control costs automatically.
 
 Harness-blind means your agent never knows: responses report the model it asked for; the truth lives in `x-router-*` response headers and the dashboard.
 
@@ -48,6 +54,13 @@ Point a harness at it and watch the dashboard:
 ```sh
 ANTHROPIC_BASE_URL=http://localhost:4141 claude     # Claude Code
 open http://localhost:4141/dashboard
+```
+
+For harnesses that support inline config, use the setup command:
+
+```sh
+bunx @curliness8029/model-router setup claude-code
+bunx @curliness8029/model-router setup codex --write
 ```
 
 That's the whole minimal setup — with no config file, the proxy fronts the direct Anthropic and OpenAI APIs. To route across multiple providers (Copilot, gateways, internal backends), declare them:
@@ -90,10 +103,15 @@ Each provider becomes a mount — point each harness provider at `http://localho
 | **`auto` model** | Advertised via `GET /v1/models`; selecting it delegates the whole choice to the router |
 | **Model allowlist** | `allowedModels` globs restrict routing targets; everything else still passes through |
 | **Multimodal-safe** | Image/document/audio requests only route to vision-capable models; tool-calling requests only to tool-capable models |
+| **Shadow mode** | Run alternative strategy on real traffic without applying it; validate before switching via `GET /api/router-eval` |
+| **Budgets** | Daily, monthly, per-upstream limits; routing tightens as limits fill; never blocks traffic |
+| **Upstream health** | Circuit breaker per upstream; latency-aware tie-breaking; open circuits skipped (fail-open) |
+| **Quality calibration** | Measure downgrade adequacy, grade via frontier model, recommend tier adjustments; apply automatically or manually |
 | **Response cache** | SQLite, TTL-based; identical requests are served for free |
 | **Plugins** | `onRequest` / `onRouteDecision` / `onResponse` / `onRecord` hooks; match scoping; priority ordering; loadable from config without forking |
 | **Adapters** | Per-upstream request/response reshaping for gateways with nonstandard JSON; `composePlugins()` for merging related plugins |
 | **Presets** | `"providers": ["anthropic", {"name":"copilot","preset":"github-copilot"}]` — endpoint/auth/path defaults for known gateways |
+| **Setup command** | `model-router setup <harness> [--write]` prints or applies config for Claude Code, Codex, opencode, Copilot, etc. |
 | **Dashboard** | Money saved, downgrade rate, cache hit rate, router performance (regret rate, sticky rate, escalation rate, task type breakdown), per-model and per-route tables |
 | **Streaming** | Byte-for-byte SSE passthrough with usage teed out for stats |
 

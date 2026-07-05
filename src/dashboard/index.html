@@ -285,6 +285,137 @@
         .tier-segment.t4 {
             background-color: #f85149;
         }
+
+        .budget-strip {
+            background-color: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 16px;
+            margin-bottom: 32px;
+        }
+
+        .budget-row {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            margin-bottom: 12px;
+        }
+
+        .budget-row:last-child {
+            margin-bottom: 0;
+        }
+
+        .budget-label {
+            font-size: 13px;
+            color: #8b949e;
+            min-width: 100px;
+        }
+
+        .budget-progress {
+            flex: 1;
+            height: 20px;
+            background-color: #0d1117;
+            border-radius: 3px;
+            overflow: hidden;
+            border: 1px solid #30363d;
+        }
+
+        .budget-fill {
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            font-weight: 600;
+            color: #0d1117;
+            transition: width 0.3s;
+        }
+
+        .budget-fill.green {
+            background-color: #3fb950;
+        }
+
+        .budget-fill.amber {
+            background-color: #d29922;
+        }
+
+        .budget-fill.red {
+            background-color: #f85149;
+        }
+
+        .budget-text {
+            font-size: 12px;
+            color: #c9d1d9;
+            min-width: 120px;
+            text-align: right;
+        }
+
+        .upstream-table {
+            width: 100%;
+            border-collapse: collapse;
+            background-color: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+
+        .circuit-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 11px;
+            font-weight: 600;
+            color: #0d1117;
+        }
+
+        .circuit-badge.closed {
+            background-color: #3fb950;
+        }
+
+        .circuit-badge.half-open {
+            background-color: #d29922;
+        }
+
+        .circuit-badge.open {
+            background-color: #f85149;
+        }
+
+        .shadow-cards-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .shadow-label {
+            font-size: 12px;
+            color: #8b949e;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+        }
+
+        .shadow-value {
+            font-size: 24px;
+            font-weight: 600;
+            color: #c9d1d9;
+            margin-bottom: 2px;
+        }
+
+        .shadow-value.green {
+            color: #3fb950;
+        }
+
+        .shadow-value.red {
+            color: #f85149;
+        }
+
+        .shadow-caption {
+            font-size: 11px;
+            color: #8b949e;
+            margin-top: 4px;
+            line-height: 1.3;
+        }
     </style>
 </head>
 <body>
@@ -306,10 +437,14 @@
         const API_STATS = '/api/stats';
         const API_HEALTH = '/health';
         const API_ROUTER_EVAL = '/api/router-eval';
+        const API_BUDGET = '/api/budget';
+        const API_UPSTREAM_HEALTH = '/api/upstream-health';
         const REFRESH_INTERVAL = 5000;
 
         let lastData = null;
         let lastRouterData = null;
+        let lastBudgetData = null;
+        let lastUpstreamData = null;
         let lastError = false;
 
         function formatNumber(n) {
@@ -394,6 +529,188 @@
                     tierDistribution: []
                 };
             }
+        }
+
+        async function fetchBudget() {
+            try {
+                const response = await fetch(API_BUDGET);
+                if (!response.ok) throw new Error('API error');
+                lastBudgetData = await response.json();
+                return lastBudgetData;
+            } catch (e) {
+                console.error('Failed to fetch budget:', e);
+                return lastBudgetData || {
+                    enabled: false,
+                    dailyUsd: 0,
+                    dailySpentUsd: 0,
+                    monthlyUsd: 0,
+                    monthlySpentUsd: 0,
+                    perMount: []
+                };
+            }
+        }
+
+        async function fetchUpstreamHealth() {
+            try {
+                const response = await fetch(API_UPSTREAM_HEALTH);
+                if (!response.ok) throw new Error('API error');
+                lastUpstreamData = await response.json();
+                return lastUpstreamData;
+            } catch (e) {
+                console.error('Failed to fetch upstream health:', e);
+                return lastUpstreamData || [];
+            }
+        }
+
+        function renderBudgetStrip(budget) {
+            if (!budget || !budget.enabled) {
+                return '';
+            }
+
+            const rows = [];
+
+            if (budget.dailyUsd !== undefined && budget.dailyUsd > 0) {
+                const spent = budget.dailySpentUsd || 0;
+                const pct = (spent / budget.dailyUsd * 100);
+                let color = 'green';
+                if (pct >= 90) color = 'red';
+                else if (pct >= 70) color = 'amber';
+
+                rows.push(`
+                    <div class="budget-row">
+                        <div class="budget-label">Daily</div>
+                        <div class="budget-progress">
+                            <div class="budget-fill ${color}" style="width: ${Math.min(pct, 100)}%"></div>
+                        </div>
+                        <div class="budget-text">$${spent.toFixed(2)} / $${budget.dailyUsd.toFixed(2)}</div>
+                    </div>
+                `);
+            }
+
+            if (budget.monthlyUsd !== undefined && budget.monthlyUsd > 0) {
+                const spent = budget.monthlySpentUsd || 0;
+                const pct = (spent / budget.monthlyUsd * 100);
+                let color = 'green';
+                if (pct >= 90) color = 'red';
+                else if (pct >= 70) color = 'amber';
+
+                rows.push(`
+                    <div class="budget-row">
+                        <div class="budget-label">Monthly</div>
+                        <div class="budget-progress">
+                            <div class="budget-fill ${color}" style="width: ${Math.min(pct, 100)}%"></div>
+                        </div>
+                        <div class="budget-text">$${spent.toFixed(2)} / $${budget.monthlyUsd.toFixed(2)}</div>
+                    </div>
+                `);
+            }
+
+            const perMount = budget.perMount || [];
+            perMount.forEach(mount => {
+                if (mount.limitUsd !== undefined && mount.limitUsd > 0) {
+                    const spent = mount.spentUsd || 0;
+                    const pct = (spent / mount.limitUsd * 100);
+                    let color = 'green';
+                    if (pct >= 90) color = 'red';
+                    else if (pct >= 70) color = 'amber';
+
+                    rows.push(`
+                        <div class="budget-row">
+                            <div class="budget-label">${mount.mount}</div>
+                            <div class="budget-progress">
+                                <div class="budget-fill ${color}" style="width: ${Math.min(pct, 100)}%"></div>
+                            </div>
+                            <div class="budget-text">$${spent.toFixed(2)} / $${mount.limitUsd.toFixed(2)}</div>
+                        </div>
+                    `);
+                }
+            });
+
+            if (rows.length === 0) {
+                return '';
+            }
+
+            return `<div class="budget-strip">${rows.join('')}</div>`;
+        }
+
+        function renderUpstreamHealth(upstreamData) {
+            if (!upstreamData || upstreamData.length === 0) {
+                return '';
+            }
+
+            let html = `
+                <div class="section">
+                    <h2 class="section-title">Upstream health</h2>
+                    <table class="upstream-table">
+                        <thead>
+                            <tr>
+                                <th>Upstream</th>
+                                <th>Latency (ms)</th>
+                                <th>OK</th>
+                                <th>Failed</th>
+                                <th>Circuit</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+            `;
+
+            upstreamData.forEach(upstream => {
+                const circuit = upstream.circuit || 'closed';
+                let circuitColor = 'closed';
+                if (circuit === 'half-open') circuitColor = 'half-open';
+                else if (circuit === 'open') circuitColor = 'open';
+
+                html += `
+                    <tr>
+                        <td>${upstream.upstream || '--'}</td>
+                        <td>${upstream.latencyMs || 0}</td>
+                        <td>${upstream.ok || 0}</td>
+                        <td>${upstream.failed || 0}</td>
+                        <td><span class="circuit-badge ${circuitColor}">${circuit}</span></td>
+                    </tr>
+                `;
+            });
+
+            html += `
+                        </tbody>
+                    </table>
+                </div>
+            `;
+            return html;
+        }
+
+        function renderShadowComparison(data) {
+            if (!data || !data.shadow) {
+                return '';
+            }
+
+            const shadow = data.shadow;
+            const decisions = shadow.decisions || 0;
+            const agreementRate = shadow.agreementRate || 0;
+            const estCostDelta = shadow.estCostDeltaUsd || 0;
+
+            let deltaColor = estCostDelta > 0 ? 'green' : 'red';
+            let deltaCaption = estCostDelta > 0
+                ? 'shadow would cost MORE (current config winning)'
+                : 'shadow would be CHEAPER (consider switching)';
+
+            return `
+                <div class="shadow-cards-grid">
+                    <div class="stat-card">
+                        <div class="shadow-label">Shadow Decisions</div>
+                        <div class="shadow-value">${decisions}</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="shadow-label">Agreement Rate</div>
+                        <div class="shadow-value">${formatPercent(agreementRate)}</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="shadow-label">Est. Cost Delta</div>
+                        <div class="shadow-value ${deltaColor}">${formatUSD(Math.abs(estCostDelta))}</div>
+                        <div class="shadow-caption">${deltaCaption}</div>
+                    </div>
+                </div>
+            `;
         }
 
         function renderEmptyState() {
@@ -644,6 +961,7 @@
                 <div class="section" style="display: block;">
                     <h2 class="section-title">Router performance</h2>
                     ${renderRouterPerfCards(data)}
+                    ${renderShadowComparison(data)}
                     <div style="margin-top: 24px;">
                         <h3 style="font-size: 14px; font-weight: 600; color: #8b949e; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.5px;">By task type</h3>
                         ${renderTaskTypeTable(data.byTaskType || [])}
@@ -656,13 +974,14 @@
             `;
         }
 
-        function renderContent(data, routerData) {
+        function renderContent(data, routerData, budgetData, upstreamData) {
             if ((data.totalRequests || 0) === 0) {
                 return renderEmptyState();
             }
 
             return `
                 ${renderStatCards(data)}
+                ${renderBudgetStrip(budgetData)}
                 <div class="section">
                     <h2 class="section-title">Savings over time</h2>
                     <div class="chart-container">
@@ -670,6 +989,7 @@
                     </div>
                 </div>
                 ${renderRouterPerformance(routerData || {})}
+                ${renderUpstreamHealth(upstreamData)}
                 <div class="section">
                     <h2 class="section-title">Routing decisions</h2>
                     ${renderRoutingTable(data.byRoute || [])}
@@ -689,9 +1009,11 @@
         async function updateDashboard() {
             const data = await fetchStats();
             const routerData = await fetchRouterEval();
+            const budgetData = await fetchBudget();
+            const upstreamData = await fetchUpstreamHealth();
             const content = document.getElementById('content');
             if (content) {
-                content.innerHTML = renderContent(data, routerData);
+                content.innerHTML = renderContent(data, routerData, budgetData, upstreamData);
                 attachChartListeners();
             }
 

@@ -12,6 +12,10 @@ model-router is configured through environment variables (runtime behavior) and 
 | `ROUTER_CONFIG` | `router.config.json` | Path to the upstream/allowlist/plugin declaration file. |
 | `ROUTER_ALLOWED_MODELS` | *(all)* | Comma-separated globs restricting routing targets, e.g. `claude-haiku-*,gpt-5.4-*`. Overrides the config file's `allowedModels`. |
 | `ROUTER_CROSS_PROVIDER` | `false` | Allow vendor switches (Claude ↔ GPT) on the OpenAI dialect. Same-dialect only — never format translation. |
+| `SHADOW_MODE` | — | Run requests under an alternative mode (aggressive/balanced/quality/off) in parallel; counterfactual model and cost recorded but never applied. Requires `SHADOW_STRATEGY` too. |
+| `SHADOW_STRATEGY` | — | Classify under an alternative strategy (heuristic/llm) during shadow mode; both results compared at `GET /api/router-eval`. |
+| `BUDGET_DAILY_USD` | — | Daily spend limit. Routing tightens as daily budget fills: <70% unchanged, 70-90% one notch stricter, >=90% aggressive. Never blocks. |
+| `BUDGET_MONTHLY_USD` | — | Monthly spend limit. Same tightening behavior as daily. |
 | `ESCALATION` | `true` | Per-conversation stuck detection and tier bumping. |
 | `CACHE_ENABLED` | `true` | Response cache for non-streaming requests. |
 | `CACHE_TTL_MS` | `3600000` | Cache entry lifetime (1 hour). |
@@ -21,6 +25,9 @@ model-router is configured through environment variables (runtime behavior) and 
 | `PRICE_FEED_URL` | LiteLLM raw JSON | Alternative feed URL (must use the same schema). |
 | `PRICE_CACHE_PATH` | `price-cache.json` | On-disk cache of the last successful feed fetch (offline fallback). |
 | `MODELS_JSON` | `models.json` | Optional manual model overrides (array of `ModelSpec`) applied at startup; these win over feed data. |
+| `CALIBRATION` | `false` | Enable quality calibration: sample downgraded non-streaming responses and grade adequacy. |
+| `CALIBRATION_SAMPLE` | `0.05` | Fraction of eligible requests to sample for grading. |
+| `CALIBRATION_APPLY` | `false` | Automatically apply tier recommendations from calibration. If false, recommendations appear in `/api/calibration` only. |
 | `PLUGIN_LOGGER` | `true` | Bundled request/latency logging plugin. |
 | `PLUGIN_TOON` | `false` | Bundled JSON→TOON prompt-compression plugin. |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` | — | Fallback credentials for the default direct-API upstreams. |
@@ -61,6 +68,80 @@ Fields:
 - `taskType` — semantic label for this task (used in stats and performance tuning).
 
 If no task rule matches, the router falls back to the default heuristic (taxonomy + structural signals).
+
+### Shadow mode
+
+Risk-free A/B testing of routing decisions on real traffic without switching production behavior:
+
+```jsonc
+"shadow": {
+  "mode": "balanced",        // alternative mode (aggressive/balanced/quality/off)
+  "strategy": "llm"          // alternative strategy (heuristic/llm); optional
+}
+```
+
+Every request is evaluated twice in parallel: once with the configured mode/strategy, once with the shadow. The counterfactual model and estimated cost are recorded but never applied. Query `GET /api/router-eval` to compare:
+
+- `shadow.decisions` — total counterfactual decisions made.
+- `shadow.agreementRate` — fraction of requests where shadow and live decisions agree.
+- `shadow.estCostDeltaUsd` — cumulative estimated cost difference (positive = shadow would cost more, i.e., live config is winning).
+
+Response header `x-router-shadow-model` reveals the shadow's model choice per request. Use shadow mode for a few days to validate a strategy change before applying it live.
+
+### Budgets
+
+Automatic spend control with mode tightening as budget fills:
+
+```jsonc
+"budgets": {
+  "dailyUsd": 100.0,         // daily spend limit
+  "monthlyUsd": 2000.0,      // monthly spend limit
+  "perMountDailyUsd": {      // per-upstream daily limits
+    "anthropic": 50.0,
+    "copilot": 30.0
+  }
+}
+```
+
+Behavior:
+
+| Budget fill | Mode override |
+|---|---|
+| < 70% | No change (use configured mode) |
+| 70–90% | Tighten one notch toward cheaper routing: quality→balanced, balanced→aggressive (aggressive and off unchanged) |
+| >= 90% | Force aggressive (cheapest capable; off mode never overridden) |
+
+Spend is measured from actual recorded costs in the stats store. Budget enforcement never blocks traffic — it only tightens the routing mode. Response headers include `x-router-budget-used` (fraction 0–1) and `x-router-mode` (when tightened). Query `GET /api/budget` for current spend vs. limits.
+
+### Upstream health
+
+Circuit breaker and latency-based upstream selection:
+
+Upstreams are monitored for failure rate and latency (exponential-weighted moving average). When an upstream receives 5 failures within 60 seconds, its circuit opens for 30 seconds; a half-open probe determines recovery. Open-circuit upstreams are skipped during pair selection (fail-open: if no candidate remains, traffic routes anyway).
+
+When two candidate (model, upstream) pairs have costs within 2%, the lower-latency upstream wins, then home upstream. Upstream health is visible at `GET /api/upstream-health`.
+
+### Quality calibration
+
+Continuous adequacy measurement and tier recommendation:
+
+```jsonc
+"calibration": {
+  "enabled": true,
+  "sampleRate": 0.05,        // fraction of eligible requests to sample
+  "apply": false,            // apply recommendations automatically (default: false)
+  "gradeIntervalMs": 21600000 // 6 hours; interval for grading samples
+}
+```
+
+How it works:
+
+1. **Sample**: downgraded non-streaming responses are sampled at `sampleRate`.
+2. **Grade**: after `gradeIntervalMs`, a frontier (tier >= 3) model grades each sample's adequacy (0–1 scale).
+3. **Recommend**: per task type, if adequacy < 0.8 with >= 5 graded samples, recommend +1 tier for that task.
+4. **Apply**: if `apply: true`, recommendations are applied automatically to the classifier. If false, they appear in `GET /api/calibration` only.
+
+Calibration never blocks or delays live requests (sampling is post-response, grading is background). It complements `regretRate` from `GET /api/router-eval` to tune downgrade aggressiveness over time.
 
 ### Providers field (shorthand and expanded)
 

@@ -37,6 +37,9 @@ Every response includes router metadata in HTTP headers:
 | `x-router-reason` | Why the router made this choice (e.g., "cheapest capable", "escalation boost", "context limit") |
 | `x-router-escalation` | (Present only if escalation applied) tier boost count |
 | `x-router-cache` | `"hit"`, `"miss"`, or `"bypass"` (streaming always bypasses) |
+| `x-router-budget-used` | (Present if budgets configured) Fraction 0–1 of the most-constrained budget window filled |
+| `x-router-mode` | (Present if budget tightening applied) Effective mode after budget constraint |
+| `x-router-shadow-model` | (Present if shadow mode enabled) Model the shadow config would have chosen |
 
 ## Error handling
 
@@ -183,6 +186,131 @@ Returns conversations currently stuck and receiving tier boosts:
   }
 ]
 ```
+
+### Budget status
+
+```
+GET /api/budget
+```
+
+Returns current spend vs. configured limits:
+
+```json
+{
+  "daily": {
+    "limitUsd": 100.0,
+    "spentUsd": 72.5,
+    "fractionUsed": 0.725
+  },
+  "monthly": {
+    "limitUsd": 2000.0,
+    "spentUsd": 1450.0,
+    "fractionUsed": 0.725
+  },
+  "perMount": [
+    {
+      "mount": "anthropic",
+      "limitUsd": 50.0,
+      "spentUsd": 35.0,
+      "fractionUsed": 0.7
+    }
+  ]
+}
+```
+
+### Upstream health
+
+```
+GET /api/upstream-health
+```
+
+Returns circuit breaker and latency status per upstream:
+
+```json
+[
+  {
+    "upstream": "anthropic",
+    "latencyMs": 245,
+    "ok": true,
+    "failed": 0,
+    "circuit": "closed"
+  },
+  {
+    "upstream": "copilot",
+    "latencyMs": 310,
+    "ok": false,
+    "failed": 4,
+    "circuit": "half-open"
+  }
+]
+```
+
+Fields:
+- `latencyMs` — exponential-weighted moving average latency.
+- `ok` — upstream is reachable and within limits.
+- `failed` — failure count in the current window (resets on recovery).
+- `circuit` — `"closed"` (normal), `"open"` (throttled), or `"half-open"` (recovery probe pending).
+
+### Quality calibration
+
+```
+GET /api/calibration
+```
+
+Returns recommendations from ongoing quality grading:
+
+```json
+{
+  "enabled": true,
+  "applied": false,
+  "sampleRate": 0.05,
+  "byTaskType": [
+    {
+      "taskType": "codegen",
+      "sampledCount": 12,
+      "gradedCount": 8,
+      "avgAdequacy": 0.72,
+      "recommendedTierDelta": 1
+    }
+  ]
+}
+```
+
+Fields:
+- `recommendedTierDelta` — +1 if adequacy < 0.8 with >=5 graded samples, else 0.
+- `applied` — whether recommendations are being applied automatically.
+
+### Router evaluation
+
+```
+GET /api/router-eval
+```
+
+Returns routing performance metrics and (if shadow mode enabled) shadow decision comparison:
+
+```json
+{
+  "totalDecisions": 15420,
+  "downgradeRate": 0.42,
+  "stickyRate": 0.11,
+  "escalationRate": 0.03,
+  "regretRate": 0.05,
+  "shadow": {
+    "decisions": 15420,
+    "agreementRate": 0.87,
+    "estCostDeltaUsd": 45.30
+  },
+  "byTaskType": [
+    { "taskType": "codegen", "requests": 3200, "avgComplexity": 0.31,
+      "avgRequiredTier": 2.1, "downgraded": 1750, "savedUsd": 4.21, "avgLatencyMs": 2100 }
+  ],
+  "tierDistribution": [
+    { "requiredTier": 1, "requests": 6200 }
+  ]
+}
+```
+
+The `shadow` block appears only if shadow mode is configured. See "How routing works" in `docs/routing.md` for metric interpretation.
 
 ### Loaded plugins
 

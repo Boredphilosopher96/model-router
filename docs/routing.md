@@ -84,7 +84,46 @@ The tracker keys conversations by a stable fingerprint (system prompt + first us
 
 Every 3 signals add +1 tier boost (max +2 by default); 4 clean responses remove one level; idle conversations are forgotten after 30 minutes. A boost raises the tier floor *and* ceiling, so a conversation stuck on a tier-1 model can be bumped to tier 2 or 3 even though it asked for the tier-1 model. Active boosts are visible at `GET /api/escalations` and on responses as `x-router-escalation`.
 
-## 8. Fail-open guarantees
+## 8. Shadow mode — safe strategy validation
+
+Run a strategy change on real traffic before committing to it:
+
+1. Configure an alternative `shadow.mode` and/or `shadow.strategy` in `router.config.json`.
+2. The router evaluates every request twice in parallel: once live, once shadow.
+3. The counterfactual (model and estimated cost) is recorded but never applied.
+4. After a few days, query `GET /api/router-eval` for `shadow.agreementRate` and `shadow.estCostDeltaUsd`.
+5. If shadow is winning (estCostDeltaUsd negative), apply it; otherwise iterate.
+
+Response header `x-router-shadow-model` shows the shadow's model choice per request.
+
+## 9. Budgets — automatic spend control
+
+Declare daily, monthly, or per-upstream daily limits in `router.config.json` under `budgets`. As the most-depleted window fills, the router tightens the mode:
+
+- <70% spent: no change.
+- 70–90% spent: one notch tighter (aggressive → balanced → quality).
+- >=90% spent: force aggressive (cheapest capable).
+
+Mode `off` is never overridden. Traffic is never blocked — only routing mode tightens. Response headers `x-router-budget-used` (fraction) and `x-router-mode` (if tightened) track the constraint. Query `GET /api/budget` for current spend vs. limits.
+
+## 10. Upstream health — circuit breaker and latency tie-break
+
+Each upstream is monitored for latency (EWMA) and failure rate. When an upstream receives 5 failures in 60 seconds, its circuit opens for 30 seconds; a half-open probe tests recovery. Open-circuit upstreams are skipped during pair selection (unless all candidates are exhausted — fail-open).
+
+When two (model, upstream) pairs have costs within 2% of each other, the lower-latency upstream wins the pair, then home upstream breaks ties. Upstream health is observable at `GET /api/upstream-health`.
+
+## 11. Quality calibration — measure, grade, recommend, apply
+
+Continuous measurement of downgrade adequacy over time:
+
+1. **Sample** downgraded non-streaming responses at a configured rate (default 5%).
+2. **Grade** each sample (after a 6-hour interval, default) using a frontier-tier model on an adequacy 0–1 scale.
+3. **Recommend** per task type: if adequacy < 0.8 with >=5 graded samples, flag +1 tier recommendation.
+4. **Apply** either automatically (if `calibration.apply: true`) or manually by inspecting `GET /api/calibration`.
+
+Calibration never blocks or delays live requests (sampling is post-response, grading runs in the background). It complements `regretRate` metrics to tune downgrade strategy over time.
+
+## 12. Fail-open guarantees
 
 The router never blocks traffic it doesn't understand:
 

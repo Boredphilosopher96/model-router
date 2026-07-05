@@ -54,5 +54,20 @@
       "preset": "openrouter",
       "enabled": false
     }
-  ]
+  ],
+  "shadow": {
+    "mode": "balanced",
+    "$comment": "Optional: evaluate an alternative mode on every request without applying it; compare at /api/router-eval."
+  },
+  "budgets": {
+    "dailyUsd": 25,
+    "monthlyUsd": 400,
+    "$comment": "Optional: routing tightens toward aggressive as a window depletes (70%/90% thresholds). Never blocks traffic."
+  },
+  "calibration": {
+    "enabled": false,
+    "sampleRate": 0.05,
+    "apply": false,
+    "$comment": "Optional: sample downgraded responses, grade adequacy on a frontier model, surface per-task tier corrections at /api/calibration."
+  }
 }

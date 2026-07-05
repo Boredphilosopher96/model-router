@@ -2,6 +2,29 @@
 
 The model-router proxy listens on `http://localhost:4141` (configurable via `PORT` env). Every harness (Claude Code, opencode, Codex CLI, GitHub Copilot, or other tools) points its LLM base URL at the proxy. The router then examines each request, picks the cheapest capable model + upstream combination, swaps only the model string, and forwards it.
 
+## One-command setup
+
+For harnesses that support inline configuration, use the setup command to print or apply router config:
+
+```bash
+model-router setup <harness> [--write]
+```
+
+Where `<harness>` is one of: `claude-code`, `codex`, `opencode`, `copilot`, `pi`.
+
+- Without `--write`: prints exact config (safe; useful for copy-paste into harness settings).
+- With `--write`: applies config automatically:
+  - `opencode`: merges into `./opencode.json` (creates `./opencode.json.bak` backup).
+  - `codex`: appends to `~/.codex/config.toml` (creates backup at `~/.codex/config.toml.bak`).
+  - Others: print instructions (safe by design — requires manual setup).
+
+Example:
+
+```bash
+model-router setup claude-code
+model-router setup codex --write
+```
+
 ## Mount styles
 
 Two path patterns direct traffic:

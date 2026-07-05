@@ -1,0 +1,18 @@
+# runtime state
+model-router.sqlite*
+price-cache.json
+
+# local-only config (commit router.config.example.json instead)
+router.config.json
+models.json
+
+# deps & artifacts
+node_modules/
+dist/
+*.log
+*.tsbuildinfo
+
+# environment & OS
+.env
+.env.*
+.DS_Store

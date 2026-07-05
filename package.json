@@ -10,7 +10,7 @@
     "./plugins": "./src/plugins/index.ts"
   },
   "bin": {
-    "model-router": "./src/cli.ts"
+    "model-router": "src/cli.ts"
   },
   "files": [
     "src",

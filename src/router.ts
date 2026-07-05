@@ -1,86 +1,11 @@
 import type { Dialect, ModelSpec, RouteDecision, RouterConfig, UpstreamProvider } from "./types.ts";
 import { getModel, listModels, normalizeModelId } from "./registry.ts";
 import type { Upstreams } from "./upstreams.ts";
+import { heuristicStrategy, structuralSignals, turnsOf, type Classification } from "./strategy.ts";
 
-/** Normalize the turn list across Anthropic messages, OpenAI chat, and OpenAI Responses shapes. */
-function turnsOf(body: any): any[] {
-  if (Array.isArray(body?.messages)) return body.messages;
-  if (Array.isArray(body?.input)) return body.input; // Responses API item list
-  if (typeof body?.input === "string") return [{ role: "user", content: body.input }];
-  return [];
-}
-
-/**
- * Estimate request complexity in [0, 1] from the raw provider body.
- * Works for Anthropic (/v1/messages), OpenAI chat (/v1/chat/completions),
- * and OpenAI Responses (/v1/responses) shapes.
- */
+/** Back-compat convenience: continuous difficulty in [0,1] from the default heuristic. */
 export function estimateComplexity(body: any): number {
-  const messages = turnsOf(body);
-
-  let promptChars = 0;
-  for (const m of messages) {
-    if (typeof m?.content === "string") promptChars += m.content.length;
-    else if (Array.isArray(m?.content)) {
-      for (const block of m.content) {
-        if (typeof block?.text === "string") promptChars += block.text.length;
-        // images / documents push complexity up
-        if (
-          block?.type === "image" ||
-          block?.type === "document" ||
-          block?.type === "image_url" ||
-          block?.type === "input_image" ||
-          block?.type === "input_file"
-        )
-          promptChars += 4000;
-      }
-    }
-  }
-  const system =
-    (typeof body?.system === "string" ? body.system : "") +
-    (typeof body?.instructions === "string" ? body.instructions : "");
-  promptChars += system.length;
-
-  const toolCount = Array.isArray(body?.tools) ? body.tools.length : 0;
-  const turnCount = messages.length;
-  const maxTokens = Number(body?.max_tokens ?? body?.max_completion_tokens ?? body?.max_output_tokens ?? 0);
-
-  // Each signal saturates independently, then they are blended.
-  const sizeScore = Math.min(promptChars / 60_000, 1); // ~15K tokens of prompt = max
-  const toolScore = Math.min(toolCount / 8, 1);
-  const turnScore = Math.min(turnCount / 30, 1);
-  const outputScore = Math.min(maxTokens / 32_000, 1);
-
-  const lastUser = [...messages].reverse().find((m) => m?.role === "user");
-  const lastText =
-    typeof lastUser?.content === "string"
-      ? lastUser.content
-      : Array.isArray(lastUser?.content)
-        ? lastUser.content.map((b: any) => b?.text ?? "").join(" ")
-        : "";
-  const hardTaskHint =
-    /\b(prove|refactor|architect|debug|optimi[sz]e|migrat\w+|design\s+a|step[- ]by[- ]step|analyz\w+|implement)\b/i.test(lastText)
-      ? 0.25
-      : 0;
-
-  const score = 0.35 * sizeScore + 0.2 * toolScore + 0.15 * turnScore + 0.15 * outputScore + hardTaskHint;
-  return Math.min(Math.max(score, 0), 1);
-}
-
-function requiredTierFor(complexity: number): number {
-  if (complexity < 0.25) return 1;
-  if (complexity < 0.5) return 2;
-  if (complexity < 0.75) return 3;
-  return 4;
-}
-
-/** Rough token estimate for context-window fitting (chars / 4). */
-function estimateInputTokens(body: any): number {
-  try {
-    return Math.ceil(JSON.stringify(body?.messages ?? body?.input ?? "").length / 4);
-  } catch {
-    return 0;
-  }
+  return (heuristicStrategy().classify(body, "") as Classification).complexity;
 }
 
 /** Does the request carry image/document/audio input? (all dialects) */
@@ -107,34 +32,66 @@ function isAutoModel(id: string): boolean {
   return norm === "auto" || norm === "model-router-auto";
 }
 
+/** Rough token split: conversation prefix (cacheable) vs this turn's fresh content. */
+export function estimateTokens(body: any): { history: number; fresh: number; output: number } {
+  const turns = turnsOf(body);
+  const chars = (v: any) => {
+    try {
+      return JSON.stringify(v ?? "").length;
+    } catch {
+      return 0;
+    }
+  };
+  const total = chars(turns) + chars(body?.system ?? body?.instructions ?? "") + chars(body?.tools ?? "");
+  const last = turns.length ? chars(turns[turns.length - 1]) : 0;
+  const history = Math.ceil(Math.max(total - last, 0) / 4);
+  const fresh = Math.ceil(last / 4);
+  const maxTokens = Number(body?.max_tokens ?? body?.max_completion_tokens ?? body?.max_output_tokens ?? 0);
+  const output = Math.ceil(Math.min(maxTokens || 1600, 8000) / 2);
+  return { history, fresh, output };
+}
+
+export interface RouteInputs {
+  body: any;
+  dialect: Dialect;
+  home: UpstreamProvider;
+  upstreams: Upstreams;
+  config: Pick<RouterConfig, "mode" | "crossProvider">;
+  /** Output of the routing strategy (heuristic or LLM classifier). */
+  classification: Classification;
+  escalationBoost?: number;
+  /** The (model, upstream) whose prompt cache is warm for this conversation. */
+  lastRoute?: { model: string; upstream: string } | null;
+}
+
 /**
- * Pick the cheapest (model, upstream) pair that can serve this request:
- *  - the model meets the required capability tier (raised by any escalation
- *    boost when the conversation is struggling), fits the context, and stays
- *    within the requested model's tier as the ceiling — except that an
- *    escalation boost may lift the ceiling ("bump up when stuck"), and
- *    `auto` has no requested ceiling at all;
- *  - the upstream speaks the request's dialect, serves the model, and is
- *    either the request's home (caller's own auth passes through) or has its
- *    own configured credentials;
- *  - price = catalog price x upstream multiplier, so a flat-rate upstream
- *    (multiplier 0, e.g. a Copilot subscription) wins whenever it can serve;
- *  - in "balanced" mode, at most one tier below the requested model;
- *  - vendor switching (claude <-> gpt) only on the OpenAI dialect and only
- *    when crossProvider is enabled — never any format translation.
+ * Pick the cheapest (model, upstream) pair for this request.
+ *
+ * Selection follows production routing practice:
+ *  - the strategy's classification sets the tier floor; the requested model's
+ *    tier is the ceiling (spend cap) — escalation boosts may lift both
+ *    ("bump up when stuck"), and `auto` has no ceiling;
+ *  - "balanced" keeps within one tier of the requested model; "quality"
+ *    additionally refuses to downgrade at all when classifier confidence is
+ *    low; "aggressive" trusts the classification fully;
+ *  - candidates must meet capability floors (vision / tool use), fit the
+ *    context window, be on the allowlist, and be served by an upstream that
+ *    speaks the dialect and is authable;
+ *  - pairs are ranked by ESTIMATED REQUEST COST, cache-aware: the pair that
+ *    served this conversation last bills its history at cached-input rates,
+ *    so long conversations stay put unless switching genuinely saves money —
+ *    switching models re-feeds the whole history at full price;
+ *  - vendor switching (Claude <-> GPT) happens only on the OpenAI dialect
+ *    and only through upstreams that serve both (crossProvider) or when
+ *    globally enabled. Never any format translation.
  */
-export function route(
-  body: any,
-  dialect: Dialect,
-  home: UpstreamProvider,
-  upstreams: Upstreams,
-  config: Pick<RouterConfig, "mode" | "crossProvider">,
-  escalationBoost = 0,
-): RouteDecision {
+export function route(inputs: RouteInputs): RouteDecision {
+  const { body, dialect, home, upstreams, config, classification, lastRoute } = inputs;
+  const escalationBoost = inputs.escalationBoost ?? 0;
   const requestedModel: string = body?.model ?? "";
   const auto = isAutoModel(requestedModel);
   const requested = auto ? undefined : getModel(requestedModel);
-  const complexity = estimateComplexity(body);
+  const { complexity, taskType, confidence } = classification;
 
   const noop = (reason: string): RouteDecision => ({
     requestedModel,
@@ -145,6 +102,9 @@ export function route(
     requiredTier: requested?.tier ?? 0,
     escalationBoost,
     auto,
+    taskType,
+    sticky: false,
+    estCostUsd: 0,
     reason,
   });
 
@@ -152,37 +112,45 @@ export function route(
   if (!auto && !requested) return noop("unknown model - passed through");
 
   const clampTier = (t: number) => Math.min(Math.max(t, 1), 4);
-  let requiredTier = clampTier(requiredTierFor(complexity) + escalationBoost);
+  let requiredTier = clampTier(classification.requiredTier + escalationBoost);
   const ceiling = auto ? 4 : clampTier((requested?.tier ?? 4) + escalationBoost);
   requiredTier = Math.min(requiredTier, ceiling);
-  if (config.mode === "balanced" && requested) {
+  if (requested && (config.mode === "balanced" || config.mode === "quality")) {
     requiredTier = clampTier(Math.max(requiredTier, requested.tier - 1));
   }
+  if (requested && config.mode === "quality" && confidence < 0.65) {
+    // Low classifier confidence in quality mode: don't gamble, keep the tier.
+    requiredTier = clampTier(Math.max(requiredTier, requested.tier));
+  }
 
-  const crossProvider = config.crossProvider === true && dialect === "openai";
-  const inputTokens = estimateInputTokens(body);
+  const tokens = estimateTokens(body);
   const needsVision = requestNeedsVision(body);
   const usesTools = requestUsesTools(body);
-  // Stay in the requested model's vendor family by default: "anthropic/claude-…"
-  // on an OpenAI-dialect gateway keeps switching among Claude models.
   const familyProvider = requested?.provider ?? dialect;
-  const modelPool = (crossProvider ? listModels() : listModels(familyProvider)).filter(
-    (m) =>
-      m.tier >= requiredTier &&
-      m.tier <= ceiling &&
-      m.contextWindow > inputTokens * 1.2 &&
-      // Capability floor: multimodal / tool requests only go to models that
-      // support them (unknown capability fails open).
-      (!needsVision || m.vision !== false) &&
-      (!usesTools || m.toolUse !== false),
-  );
+  const globalCross = config.crossProvider === true && dialect === "openai";
+  const inputTokens = tokens.history + tokens.fresh;
+
+  const modelOk = (m: ModelSpec) =>
+    m.tier >= requiredTier &&
+    m.tier <= ceiling &&
+    m.contextWindow > inputTokens * 1.2 &&
+    (!needsVision || m.vision !== false) &&
+    (!usesTools || m.toolUse !== false);
 
   const servers = upstreams.list(dialect).filter((u) => u.name === home.name || upstreams.hasOwnAuth(u));
-  const pairs: Array<{ spec: ModelSpec; upstream: UpstreamProvider; cost: number }> = [];
-  for (const spec of modelPool) {
+  const warm = (spec: ModelSpec, u: UpstreamProvider) =>
+    !!lastRoute && normalizeModelId(lastRoute.model) === normalizeModelId(spec.id) && lastRoute.upstream === u.name;
+
+  const pairs: Array<{ spec: ModelSpec; upstream: UpstreamProvider; cost: number; warm: boolean }> = [];
+  for (const spec of listModels()) {
+    if (!modelOk(spec)) continue;
     for (const u of servers) {
       if (!upstreams.serves(u, spec)) continue;
-      pairs.push({ spec, upstream: u, cost: upstreams.effectiveBlended(u, spec) });
+      // Vendor discipline: stay in the requested model's family unless this
+      // upstream serves multiple vendors in one dialect (or global override).
+      if (spec.provider !== familyProvider && !(globalCross || (u.crossProvider === true && dialect === "openai"))) continue;
+      const isWarm = warm(spec, u);
+      pairs.push({ spec, upstream: u, warm: isWarm, cost: upstreams.estimateCostUsd(u, spec, tokens, isWarm) });
     }
   }
   pairs.sort(
@@ -191,8 +159,20 @@ export function route(
 
   const pick = pairs[0];
   if (!pick || (requested && pick.spec.id === requested.id && pick.upstream.name === home.name)) {
-    return noop(`kept requested model (required tier ${requiredTier}${escalationBoost ? `, boost +${escalationBoost}` : ""})`);
+    return {
+      ...noop(`kept requested model (${taskType}, required tier ${requiredTier}${escalationBoost ? `, boost +${escalationBoost}` : ""})`),
+      requiredTier,
+      sticky: !!pick?.warm,
+      estCostUsd: pick?.cost ?? 0,
+    };
   }
+
+  // Sticky: the cache-warm pair won even though a colder pair had a lower
+  // raw price — i.e. staying put was the cheaper total.
+  const cheapestCold = pairs.find((p) => !p.warm);
+  const sticky =
+    pick.warm && !!cheapestCold && normalizeModelId(cheapestCold.spec.id) !== normalizeModelId(pick.spec.id);
+
   return {
     requestedModel,
     routedModel: upstreams.wireModelId(pick.upstream, pick.spec, auto ? "" : requestedModel),
@@ -202,8 +182,14 @@ export function route(
     requiredTier,
     escalationBoost,
     auto,
+    taskType,
+    sticky,
+    estCostUsd: pick.cost,
     reason:
-      `complexity ${complexity.toFixed(2)}${escalationBoost ? ` +${escalationBoost} escalation` : ""}` +
-      ` -> tier ${requiredTier}; ${pick.spec.id} via ${pick.upstream.name} is cheapest capable`,
+      `${taskType} (confidence ${confidence.toFixed(2)})` +
+      `${escalationBoost ? ` +${escalationBoost} escalation` : ""} -> tier ${requiredTier}; ` +
+      (sticky
+        ? `stayed on ${pick.spec.id} via ${pick.upstream.name} - warm prompt cache beats switching`
+        : `${pick.spec.id} via ${pick.upstream.name} is cheapest capable (est $${pick.cost.toFixed(6)})`),
   };
 }

@@ -1,6 +1,7 @@
 export { startServer, extractStreamUsage, type RouterServer } from "./server.ts";
-export { PluginPipeline, type ProxyPlugin, type PluginContext } from "./plugins/index.ts";
-export { route, estimateComplexity, requestNeedsVision, requestUsesTools } from "./router.ts";
+export { PluginPipeline, composePlugins, pluginApplies, type ProxyPlugin, type PluginContext } from "./plugins/index.ts";
+export { route, estimateComplexity, estimateTokens, requestNeedsVision, requestUsesTools, type RouteInputs } from "./router.ts";
+export { heuristicStrategy, llmStrategy, structuralSignals, lastUserText, type Classification, type RoutingStrategy } from "./strategy.ts";
 export {
   registerModel,
   getModel,
@@ -12,7 +13,7 @@ export {
   isAllowed,
   DEFAULT_MODELS,
 } from "./registry.ts";
-export { Upstreams, loadUpstreams, loadRouterSetup, toStyleOf, kindOf, DEFAULT_UPSTREAMS } from "./upstreams.ts";
+export { Upstreams, loadUpstreams, loadRouterSetup, resolveUpstream, toStyleOf, kindOf, PRESETS, DEFAULT_UPSTREAMS } from "./upstreams.ts";
 export { EscalationTracker, conversationKey, DEFAULT_ESCALATION } from "./escalation.ts";
 export { loadConfig } from "./config.ts";
 export { startPriceAutoUpdate, parseFeed, parseGatewayFeed, gatewayPricing, familyOf, DEFAULT_FEED_URL } from "./pricefeed.ts";

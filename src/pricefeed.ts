@@ -17,6 +17,7 @@ interface FeedEntry {
   mode?: string;
   input_cost_per_token?: number;
   output_cost_per_token?: number;
+  cache_read_input_token_cost?: number;
   max_input_tokens?: number;
   supports_vision?: boolean;
   supports_function_calling?: boolean;
@@ -145,6 +146,10 @@ export function parseFeed(feed: Record<string, FeedEntry>): ModelSpec[] {
       provider,
       inputPer1M: Number((entry.input_cost_per_token * 1_000_000).toFixed(6)),
       outputPer1M: Number((entry.output_cost_per_token * 1_000_000).toFixed(6)),
+      cachedInputPer1M:
+        entry.cache_read_input_token_cost != null
+          ? Number((entry.cache_read_input_token_cost * 1_000_000).toFixed(6))
+          : undefined,
       tier: 1,
       contextWindow: entry.max_input_tokens ?? 128_000,
       enabled: true,

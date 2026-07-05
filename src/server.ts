@@ -14,6 +14,7 @@ import { cacheKey, createCache } from "./cache.ts";
 import { createStats } from "./stats.ts";
 import { EscalationTracker, conversationKey } from "./escalation.ts";
 import { Upstreams, loadRouterSetup, resolveModulePath } from "./upstreams.ts";
+import { heuristicStrategy, llmStrategy, type RoutingStrategy } from "./strategy.ts";
 // `with { type: "text" }` yields a string at runtime; @types/bun types *.html as HTMLBundle.
 import dashboardHtmlImport from "./dashboard/index.html" with { type: "text" };
 const dashboardHtml = dashboardHtmlImport as unknown as string;
@@ -45,6 +46,36 @@ export async function startServer(config: RouterConfig, plugins: PluginPipeline 
     resolveModulePath(p, config.upstreamsConfigPath),
   );
 
+  // Routing strategy: fast multi-signal heuristic by default; optionally an
+  // LLM classifier that asks a tier-1 model once per conversation.
+  const heuristic = heuristicStrategy({ taskRules: [...setup.taskRules, ...(config.taskRules ?? [])] });
+  const classifierComplete = async (prompt: string): Promise<string> => {
+    const spec = listModels()
+      .filter((m) => m.tier === 1)
+      .sort((a, b) => a.inputPer1M - b.inputPer1M)[0];
+    if (!spec) throw new Error("no tier-1 model available for classification");
+    const dialect: Dialect = spec.provider;
+    const u = upstreams.list(dialect).find((x) => upstreams.hasOwnAuth(x));
+    if (!u) throw new Error(`no authable ${dialect} upstream for classification`);
+    const body =
+      dialect === "anthropic"
+        ? { model: spec.id, max_tokens: 40, messages: [{ role: "user", content: prompt }] }
+        : { model: spec.id, max_tokens: 40, messages: [{ role: "user", content: prompt }] };
+    const path = dialect === "anthropic" ? "/v1/messages" : "/v1/chat/completions";
+    const resp = await fetch(upstreams.url(u, path), {
+      method: "POST",
+      headers: upstreams.headers(u, dialect, new Headers(), false),
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) throw new Error(`classifier upstream ${resp.status}`);
+    const json: any = await resp.json();
+    return dialect === "anthropic"
+      ? (json?.content?.find((b: any) => b.type === "text")?.text ?? "")
+      : (json?.choices?.[0]?.message?.content ?? "");
+  };
+  const strategy: RoutingStrategy =
+    config.strategy === "llm" ? llmStrategy(classifierComplete, heuristic) : heuristic;
+
   // Header values must be ISO-8859-1 safe; model ids and reasons are user-influenced.
   const headerSafe = (s: string) => s.replace(/[^\x20-\x7e]/g, "?").slice(0, 500);
 
@@ -60,16 +91,34 @@ export async function startServer(config: RouterConfig, plugins: PluginPipeline 
       return Response.json({ error: "invalid JSON body" }, { status: 400 });
     }
 
-    const ctx: PluginContext = { provider: dialect, path, requestedModel: String(body?.model ?? ""), state: {} };
+    const ctx: PluginContext = {
+      provider: dialect,
+      path,
+      mount: home.name,
+      requestedModel: String(body?.model ?? ""),
+      state: {},
+    };
     body = await plugins.runRequest(body, ctx);
 
     // Escalation: has this conversation been struggling on a small model?
     const convo = conversationKey(dialect, body);
     const boost = config.escalationEnabled === false ? 0 : escalation.observeRequest(convo, body);
 
-    let decision = route(body, dialect, home, upstreams, config, boost);
+    const classification = await strategy.classify(body, convo);
+    let decision = route({
+      body,
+      dialect,
+      home,
+      upstreams,
+      config,
+      classification,
+      escalationBoost: boost,
+      lastRoute: escalation.lastRoute(convo),
+    });
     decision = await plugins.runRouteDecision(decision, body, ctx);
     ctx.routedModel = decision.routedModel;
+    ctx.taskType = decision.taskType;
+    escalation.noteRouted(convo, decision.routedModel, decision.upstream);
     const target = upstreams.get(decision.upstream) ?? home;
     const adapter = upstreams.adapterOf(target.name);
     const isHomeTarget = target.name === home.name;
@@ -84,6 +133,8 @@ export async function startServer(config: RouterConfig, plugins: PluginPipeline 
       "x-router-reason": headerSafe(decision.reason),
     };
     if (decision.escalationBoost > 0) routerHeaders["x-router-escalation"] = String(decision.escalationBoost);
+    if (decision.sticky) routerHeaders["x-router-sticky"] = "1";
+    routerHeaders["x-router-task"] = headerSafe(decision.taskType);
 
     const record = (usage: { inputTokens: number; outputTokens: number }, cacheHit: boolean, latencyMs: number) => {
       const costActual = cacheHit || !routedSpec ? 0 : upstreams.costUsd(target, routedSpec, usage.inputTokens, usage.outputTokens);
@@ -104,6 +155,12 @@ export async function startServer(config: RouterConfig, plugins: PluginPipeline 
         cacheHit,
         downgraded: decision.routedModel !== decision.requestedModel,
         latencyMs,
+        taskType: decision.taskType,
+        complexity: decision.complexity,
+        requiredTier: decision.requiredTier,
+        escalationBoost: decision.escalationBoost,
+        sticky: decision.sticky,
+        conversation: convo,
       };
       plugins.runRecord(rec, ctx).finally(() => {
         try {
@@ -270,6 +327,7 @@ export async function startServer(config: RouterConfig, plugins: PluginPipeline 
       if (pathname === "/api/upstreams")
         return Response.json(upstreams.list().map(({ name, baseUrl, dialect: d, models, priceMultiplier }) => ({ name, baseUrl, dialect: d, models, priceMultiplier })));
       if (pathname === "/api/escalations") return Response.json(escalation.snapshot());
+      if (pathname === "/api/router-eval") return Response.json(stats.routerEval());
       if (pathname === "/api/plugins") return Response.json(plugins.list());
       if (pathname === "/health")
         return Response.json({

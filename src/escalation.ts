@@ -39,6 +39,9 @@ interface ConvoState {
   lastSeen: number;
   lastTurnCount: number;
   entries: number;
+  /** Last (model, upstream) that served this conversation — its prompt cache is warm there. */
+  lastModel?: string;
+  lastUpstream?: string;
 }
 
 /** Stable conversation identity: hash of system prompt + first user turn. */
@@ -107,6 +110,19 @@ export class EscalationTracker {
     s.lastSeen = now;
     this.applyThresholds(s);
     return s.boost;
+  }
+
+  /** Remember which (model, upstream) served this conversation — used for cache-aware stickiness. */
+  noteRouted(key: string, model: string, upstream: string): void {
+    const s = this.state(key);
+    s.lastModel = model;
+    s.lastUpstream = upstream;
+  }
+
+  /** The (model, upstream) whose prompt cache is warm for this conversation, if any. */
+  lastRoute(key: string): { model: string; upstream: string } | null {
+    const s = this.convos.get(key);
+    return s?.lastModel && s?.lastUpstream ? { model: s.lastModel, upstream: s.lastUpstream } : null;
   }
 
   /** Report the outcome of the upstream call for this conversation. */

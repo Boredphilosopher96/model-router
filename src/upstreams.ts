@@ -29,10 +29,35 @@ export const DEFAULT_UPSTREAMS: UpstreamProvider[] = [
   },
 ];
 
+/**
+ * Presets: shorthand for well-known endpoints. Any field the user sets
+ * explicitly wins; a bare string in `providers` (e.g. "github-copilot")
+ * expands to { name, preset } with the same value.
+ */
+export const PRESETS: Record<string, Partial<UpstreamProvider>> = {
+  anthropic: { baseUrl: "https://api.anthropic.com", dialect: "anthropic", models: ["claude-*"], apiKeyEnv: "ANTHROPIC_API_KEY" },
+  openai: { baseUrl: "https://api.openai.com", dialect: "openai", models: ["gpt-*", "o*"], apiKeyEnv: "OPENAI_API_KEY" },
+  "github-copilot": { baseUrl: "https://api.githubcopilot.com", dialect: "openai", authStyle: "passthrough", stripV1: true, crossProvider: true },
+  "github-models": { baseUrl: "https://models.github.ai/inference", dialect: "openai", apiKeyEnv: "GITHUB_TOKEN", authStyle: "bearer", stripV1: true, crossProvider: true },
+  openrouter: { baseUrl: "https://openrouter.ai/api", dialect: "openai", models: ["claude-*", "gpt-*"], apiKeyEnv: "OPENROUTER_API_KEY", authStyle: "bearer", vendorPrefix: true, crossProvider: true },
+};
+
+/** Expand preset + validate an upstream declaration. */
+export function resolveUpstream(raw: UpstreamProvider | string): UpstreamProvider {
+  const base: UpstreamProvider = typeof raw === "string" ? ({ name: raw, preset: raw } as UpstreamProvider) : raw;
+  const preset = base.preset ? PRESETS[base.preset] : undefined;
+  if (base.preset && !preset) throw new Error(`unknown upstream preset: ${base.preset} (known: ${Object.keys(PRESETS).join(", ")})`);
+  const merged = { ...preset, ...Object.fromEntries(Object.entries(base).filter(([, v]) => v !== undefined)) } as UpstreamProvider;
+  if (!merged.name || !merged.baseUrl || !merged.dialect) {
+    throw new Error(`invalid upstream (needs name + baseUrl + dialect, or a preset): ${JSON.stringify(raw)}`);
+  }
+  return merged;
+}
+
 /** Gateway kinds with feed-driven pricing, inferred from the host. */
 export function kindOf(u: UpstreamProvider): string | null {
   try {
-    const host = new URL(u.baseUrl).host;
+    const host = new URL(u.baseUrl ?? "").host;
     if (host.includes("githubcopilot")) return "github_copilot";
     if (host === "models.github.ai" || host.endsWith(".github.ai")) return "github";
     return null;
@@ -100,28 +125,53 @@ export class Upstreams {
   /**
    * Effective per-1M prices for a (upstream, model) pair — fully automatic:
    *  1. explicit `pricing` on the upstream (custom/private models),
-   *  2. the live gateway feed (GitHub Copilot etc.; absent costs = flat-rate 0),
+   *  2. the live gateway feed where it carries real per-token costs,
    *  3. catalog API pricing x the manual multiplier if one was set (default 1).
+   *
+   * Note: GitHub Copilot moved to token-based AI-credit billing (June 2026)
+   * at roughly API-parity rates, so it is priced like any other endpoint —
+   * feed costs when present, catalog rates otherwise. Feed entries without
+   * per-token costs are treated as availability data only, not as "free".
    */
-  pricesFor(u: UpstreamProvider, spec: ModelSpec): { inputPer1M: number; outputPer1M: number } {
+  pricesFor(u: UpstreamProvider, spec: ModelSpec): { inputPer1M: number; outputPer1M: number; cachedInputPer1M: number } {
     const norm = normalizeModelId(spec.id);
     for (const [id, p] of Object.entries(u.pricing ?? {})) {
-      if (normalizeModelId(id) === norm) return { inputPer1M: p.inputPer1M, outputPer1M: p.outputPer1M };
+      if (normalizeModelId(id) === norm)
+        return { inputPer1M: p.inputPer1M, outputPer1M: p.outputPer1M, cachedInputPer1M: p.inputPer1M * 0.1 };
     }
     const kind = kindOf(u);
     if (kind) {
       const feed = gatewayPricing(kind, norm);
-      if (feed) return { inputPer1M: feed.inputPer1M ?? 0, outputPer1M: feed.outputPer1M ?? 0 };
-      // Known subscription gateway, model not in feed yet: still flat-rate.
-      if (kind === "github_copilot") return { inputPer1M: 0, outputPer1M: 0 };
+      if (feed && feed.inputPer1M != null && feed.outputPer1M != null) {
+        return { inputPer1M: feed.inputPer1M, outputPer1M: feed.outputPer1M, cachedInputPer1M: feed.inputPer1M * 0.1 };
+      }
     }
     const mult = u.priceMultiplier ?? 1;
-    return { inputPer1M: spec.inputPer1M * mult, outputPer1M: spec.outputPer1M * mult };
+    return {
+      inputPer1M: spec.inputPer1M * mult,
+      outputPer1M: spec.outputPer1M * mult,
+      cachedInputPer1M: (spec.cachedInputPer1M ?? spec.inputPer1M * 0.1) * mult,
+    };
   }
 
   effectiveBlended(u: UpstreamProvider, spec: ModelSpec): number {
     const p = this.pricesFor(u, spec);
     return 0.75 * p.inputPer1M + 0.25 * p.outputPer1M;
+  }
+
+  /**
+   * Estimated USD cost of a request on this (upstream, model), cache-aware:
+   * history tokens already cached on this pair bill at the cached-input rate.
+   */
+  estimateCostUsd(
+    u: UpstreamProvider,
+    spec: ModelSpec,
+    tokens: { history: number; fresh: number; output: number },
+    cacheWarm: boolean,
+  ): number {
+    const p = this.pricesFor(u, spec);
+    const historyRate = cacheWarm ? p.cachedInputPer1M : p.inputPer1M;
+    return (tokens.history * historyRate + tokens.fresh * p.inputPer1M + tokens.output * p.outputPer1M) / 1_000_000;
   }
 
   /** USD cost of a completed call on this upstream. */
@@ -152,7 +202,7 @@ export class Upstreams {
   /** Compose the full upstream URL for a proxy path like /v1/messages. */
   url(u: UpstreamProvider, path: string, search = ""): string {
     const p = u.stripV1 ? path.replace(/^\/v1/, "") : path;
-    return `${u.baseUrl.replace(/\/$/, "")}${p}${search}`;
+    return `${(u.baseUrl ?? "").replace(/\/$/, "")}${p}${search}`;
   }
 
   /**
@@ -203,11 +253,17 @@ export function toStyleOf(requestedRaw: string, routed: ModelSpec): string {
   const prefix = slash >= 0 ? requestedRaw.slice(0, slash + 1) : "";
   const tail = slash >= 0 ? requestedRaw.slice(slash + 1) : requestedRaw;
 
+  // Dot/dash restyling only applies within the same vendor - Claude ids use
+  // dashes and GPT ids use dots natively, so a cross-vendor swap keeps the
+  // routed model's own canonical id.
+  const tailVendor = /^claude/i.test(tail) ? "anthropic" : /^(gpt|o\d)/i.test(tail) ? "openai" : null;
   let routedTail = routed.id;
-  const tailUsesDots = /\d\.\d/.test(tail);
-  const specUsesDots = /\d\.\d/.test(routed.id);
-  if (tailUsesDots && !specUsesDots) routedTail = routed.id.replace(/(\d)-(\d)/g, "$1.$2");
-  else if (!tailUsesDots && specUsesDots) routedTail = routed.id.replace(/(\d)\.(\d)/g, "$1-$2");
+  if (tailVendor === routed.provider) {
+    const tailUsesDots = /\d\.\d/.test(tail);
+    const specUsesDots = /\d\.\d/.test(routed.id);
+    if (tailUsesDots && !specUsesDots) routedTail = routed.id.replace(/(\d)-(\d)/g, "$1.$2");
+    else if (!tailUsesDots && specUsesDots) routedTail = routed.id.replace(/(\d)\.(\d)/g, "$1-$2");
+  }
 
   let outPrefix = prefix;
   if (prefix) {
@@ -222,15 +278,18 @@ export function toStyleOf(requestedRaw: string, routed: ModelSpec): string {
 }
 
 interface RouterFile {
-  providers?: UpstreamProvider[];
+  providers?: Array<UpstreamProvider | string>;
   allowedModels?: string[];
   plugins?: string[];
+  taskRules?: Array<{ pattern: string; tier: 1 | 2 | 3 | 4; taskType?: string }>;
 }
 
 export interface RouterSetup {
   upstreams: Upstreams;
   /** Plugin module paths declared in the config file. */
   pluginPaths: string[];
+  /** User task rules declared in the config file. */
+  taskRules: Array<{ pattern: string; tier: 1 | 2 | 3 | 4; taskType?: string }>;
 }
 
 /** Guess the vendor for a custom-priced model id. */
@@ -274,13 +333,10 @@ export async function loadRouterSetup(
     if (await file.exists()) {
       const parsed = (await file.json()) as RouterFile | UpstreamProvider[];
       fileConf = Array.isArray(parsed) ? { providers: parsed } : parsed;
-      for (const p of fileConf.providers ?? []) {
-        if (!p?.name || !p?.baseUrl || !p?.dialect) throw new Error(`invalid upstream in ${configPath}: ${JSON.stringify(p)}`);
-        declared.push(p);
-      }
+      for (const p of fileConf.providers ?? []) declared.push(resolveUpstream(p));
     }
   }
-  for (const p of inline ?? []) declared.push(p);
+  for (const p of inline ?? []) declared.push(resolveUpstream(p));
 
   // Direct-API defaults fill any dialect that has no declared upstream.
   const names = new Set(declared.map((p) => p.name));
@@ -295,7 +351,7 @@ export async function loadRouterSetup(
       if (!getModel(id)) {
         registerModel({
           id,
-          provider: providerFor(id, p.dialect),
+          provider: providerFor(id, p.dialect ?? "both"),
           inputPer1M: pricing.inputPer1M,
           outputPer1M: pricing.outputPer1M,
           tier: tierForPrice(pricing),
@@ -325,7 +381,11 @@ export async function loadRouterSetup(
   }
 
   setModelAllowlist(allowedModels ?? fileConf.allowedModels ?? null);
-  return { upstreams: new Upstreams(declared, adapters), pluginPaths: fileConf.plugins ?? [] };
+  return {
+    upstreams: new Upstreams(declared, adapters),
+    pluginPaths: fileConf.plugins ?? [],
+    taskRules: fileConf.taskRules ?? [],
+  };
 }
 
 /** Resolve ./relative module paths against the config file's directory. */

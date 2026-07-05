@@ -21,7 +21,13 @@ export function createStats(dbPath: string): StatsStore {
       saved_usd REAL NOT NULL,
       cache_hit INTEGER NOT NULL,
       downgraded INTEGER NOT NULL,
-      latency_ms REAL NOT NULL
+      latency_ms REAL NOT NULL,
+      task_type TEXT NOT NULL DEFAULT '',
+      complexity REAL NOT NULL DEFAULT 0,
+      required_tier INTEGER NOT NULL DEFAULT 0,
+      boost INTEGER NOT NULL DEFAULT 0,
+      sticky INTEGER NOT NULL DEFAULT 0,
+      convo TEXT NOT NULL DEFAULT ''
     )
   `);
 
@@ -31,8 +37,9 @@ export function createStats(dbPath: string): StatsStore {
   const recordStmt = db.prepare(`
     INSERT INTO requests (
       ts, provider, upstream, requested_model, routed_model, input_tokens, output_tokens,
-      cost_actual, cost_baseline, saved_usd, cache_hit, downgraded, latency_ms
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      cost_actual, cost_baseline, saved_usd, cache_hit, downgraded, latency_ms,
+      task_type, complexity, required_tier, boost, sticky, convo
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   return {
@@ -50,8 +57,73 @@ export function createStats(dbPath: string): StatsStore {
         rec.savedUsd,
         rec.cacheHit ? 1 : 0,
         rec.downgraded ? 1 : 0,
-        rec.latencyMs
+        rec.latencyMs,
+        rec.taskType,
+        rec.complexity,
+        rec.requiredTier,
+        rec.escalationBoost,
+        rec.sticky ? 1 : 0,
+        rec.conversation
       );
+    },
+
+    routerEval() {
+      const totals = db
+        .prepare(
+          `SELECT COUNT(*) AS total,
+                  SUM(downgraded) AS downgraded,
+                  SUM(sticky) AS sticky,
+                  SUM(CASE WHEN boost > 0 THEN 1 ELSE 0 END) AS escalated
+           FROM requests`
+        )
+        .get() as { total: number; downgraded: number | null; sticky: number | null; escalated: number | null };
+
+      const regret = db
+        .prepare(
+          `SELECT
+             (SELECT COUNT(DISTINCT convo) FROM requests WHERE downgraded = 1 AND convo != '') AS downgraded_convos,
+             (SELECT COUNT(DISTINCT convo) FROM requests
+                WHERE convo != '' AND boost > 0
+                  AND convo IN (SELECT DISTINCT convo FROM requests WHERE downgraded = 1)) AS regretted_convos`
+        )
+        .get() as { downgraded_convos: number; regretted_convos: number };
+
+      const byTaskType = db
+        .prepare(
+          `SELECT task_type AS taskType, COUNT(*) AS requests,
+                  AVG(complexity) AS avgComplexity, AVG(required_tier) AS avgRequiredTier,
+                  SUM(downgraded) AS downgraded, SUM(saved_usd) AS savedUsd, AVG(latency_ms) AS avgLatencyMs
+           FROM requests WHERE task_type != ''
+           GROUP BY task_type ORDER BY requests DESC`
+        )
+        .all() as any[];
+
+      const tierDistribution = db
+        .prepare(
+          `SELECT required_tier AS requiredTier, COUNT(*) AS requests
+           FROM requests WHERE required_tier > 0 GROUP BY required_tier ORDER BY required_tier`
+        )
+        .all() as any[];
+
+      const total = totals.total || 0;
+      const rate = (n: number | null) => (total > 0 ? (n ?? 0) / total : 0);
+      return {
+        totalDecisions: total,
+        downgradeRate: rate(totals.downgraded),
+        stickyRate: rate(totals.sticky),
+        escalationRate: rate(totals.escalated),
+        regretRate: regret.downgraded_convos > 0 ? regret.regretted_convos / regret.downgraded_convos : 0,
+        byTaskType: byTaskType.map((r) => ({
+          taskType: r.taskType,
+          requests: r.requests,
+          avgComplexity: r.avgComplexity ?? 0,
+          avgRequiredTier: r.avgRequiredTier ?? 0,
+          downgraded: r.downgraded ?? 0,
+          savedUsd: r.savedUsd ?? 0,
+          avgLatencyMs: r.avgLatencyMs ?? 0,
+        })),
+        tierDistribution: tierDistribution.map((r) => ({ requiredTier: r.requiredTier, requests: r.requests })),
+      };
     },
 
     summary(): StatsSummary {

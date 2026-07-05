@@ -10,9 +10,21 @@ export type Dialect = "anthropic" | "openai";
 export interface UpstreamProvider {
   /** Unique name; also the mount path /p/<name>/v1/... */
   name: string;
-  baseUrl: string;
+  /**
+   * Fills baseUrl/dialect/auth/path defaults for well-known endpoints:
+   * "anthropic" | "openai" | "github-copilot" | "github-models" | "openrouter".
+   * Any field you set explicitly wins over the preset.
+   */
+  preset?: string;
+  baseUrl?: string;
   /** Which wire format(s) this endpoint accepts. */
-  dialect: Dialect | "both";
+  dialect?: Dialect | "both";
+  /**
+   * This endpoint serves multiple vendors in one dialect (GitHub, OpenRouter…):
+   * allow the router to swap vendors (Claude <-> GPT) within it. Same dialect
+   * only — never format translation. Default false.
+   */
+  crossProvider?: boolean;
   /**
    * Globs of model ids this upstream can serve (matched against normalized
    * catalog ids), e.g. ["claude-*"] or ["claude-*", "gpt-*"].
@@ -60,6 +72,8 @@ export interface ModelSpec {
   provider: Provider;
   inputPer1M: number;
   outputPer1M: number;
+  /** Price of cache-read input tokens. Default: 10% of inputPer1M. */
+  cachedInputPer1M?: number;
   /** Capability tier: 1 = smallest/cheapest … 4 = frontier. */
   tier: 1 | 2 | 3 | 4;
   contextWindow: number;
@@ -110,6 +124,12 @@ export interface RouteDecision {
   escalationBoost: number;
   /** True when the caller selected the "auto" model. */
   auto: boolean;
+  /** Task classification from the routing strategy (e.g. "codegen", "lookup"). */
+  taskType: string;
+  /** True when the pick stayed on the conversation's previous model to keep its prompt cache warm. */
+  sticky: boolean;
+  /** Estimated cost of this request on the chosen (model, upstream), USD. */
+  estCostUsd: number;
   reason: string;
 }
 
@@ -117,8 +137,12 @@ export interface RouteDecision {
 export interface PluginContext {
   provider: Provider;
   path: string;
+  /** Home upstream name (the /p/<mount> the request arrived on, or the dialect default). */
+  mount: string;
   requestedModel: string;
   routedModel?: string;
+  /** Task classification, available from onRouteDecision onwards. */
+  taskType?: string;
   /** Scratch space plugins can use to pass data from onRequest to onResponse. */
   state: Record<string, unknown>;
 }
@@ -133,6 +157,19 @@ export interface PluginContext {
  */
 export interface ProxyPlugin {
   name: string;
+  /** Lower runs earlier on requests (and later on responses). Default 100. */
+  priority?: number;
+  /**
+   * Scope the plugin to a subset of traffic; hooks are skipped elsewhere.
+   * All present conditions must match. Globs allowed in models/mounts.
+   * This is what lets model-router plugins coexist with harness-level or
+   * provider-specific plugins without touching each other's traffic.
+   */
+  match?: {
+    mounts?: string[];
+    dialects?: Dialect[];
+    models?: string[];
+  };
   /** Transform the incoming request body before routing. */
   onRequest?(body: any, ctx: PluginContext): any | Promise<any>;
   /** Inspect or override the routing decision (return a decision to replace it). */
@@ -161,6 +198,14 @@ export interface RequestRecord {
   cacheHit: boolean;
   downgraded: boolean;
   latencyMs: number;
+  /** Routing-evaluation fields. */
+  taskType: string;
+  complexity: number;
+  requiredTier: number;
+  escalationBoost: number;
+  sticky: boolean;
+  /** Conversation fingerprint — lets the evaluator link decisions to later escalations. */
+  conversation: string;
 }
 
 /** Aggregate stats served to the dashboard at /api/stats. */
@@ -206,10 +251,37 @@ export interface ResponseCache {
   size(): number;
 }
 
+/** Router-performance metrics for strategy tuning, served at /api/router-eval. */
+export interface RouterEval {
+  totalDecisions: number;
+  /** Share of requests routed to a different model than requested. */
+  downgradeRate: number;
+  /** Share of requests kept on a pricier model because its prompt cache was warm. */
+  stickyRate: number;
+  /** Share of requests that carried an escalation boost. */
+  escalationRate: number;
+  /**
+   * Share of downgraded conversations that later needed escalation — the
+   * router's misjudgment signal. High regret => routing too aggressively.
+   */
+  regretRate: number;
+  byTaskType: Array<{
+    taskType: string;
+    requests: number;
+    avgComplexity: number;
+    avgRequiredTier: number;
+    downgraded: number;
+    savedUsd: number;
+    avgLatencyMs: number;
+  }>;
+  tierDistribution: Array<{ requiredTier: number; requests: number }>;
+}
+
 /** Persistent request log + aggregations. Implemented in src/stats.ts (bun:sqlite). */
 export interface StatsStore {
   record(rec: RequestRecord): void;
   summary(): StatsSummary;
+  routerEval(): RouterEval;
 }
 
 export interface RouterConfig {
@@ -217,9 +289,11 @@ export interface RouterConfig {
   /**
    * aggressive: always route to the cheapest model meeting the required tier.
    * balanced: route down at most one tier below the requested model.
+   * quality: like balanced, but refuses to downgrade at all when classifier
+   *          confidence is low — bias toward the requested model.
    * off: never change the model (proxy/cache/stats still apply).
    */
-  mode: "aggressive" | "balanced" | "off";
+  mode: "aggressive" | "balanced" | "quality" | "off";
   cacheTtlMs: number;
   cacheEnabled: boolean;
   dbPath: string;
@@ -243,4 +317,16 @@ export interface RouterConfig {
   crossProvider?: boolean;
   /** Per-conversation stuck-detection and tier bumping. Default true. */
   escalationEnabled?: boolean;
+  /**
+   * Routing strategy: "heuristic" (default — multi-signal task classifier,
+   * sub-millisecond) or "llm" (a tier-1 model classifies each new
+   * conversation once; falls back to heuristic on error/timeout).
+   */
+  strategy?: "heuristic" | "llm";
+  /**
+   * User-defined task rules evaluated before built-in classification:
+   * first match wins. Patterns are case-insensitive regexes tested against
+   * the latest user message.
+   */
+  taskRules?: Array<{ pattern: string; tier: 1 | 2 | 3 | 4; taskType?: string }>;
 }

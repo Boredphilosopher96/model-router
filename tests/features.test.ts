@@ -461,6 +461,7 @@ describe("Features: Plugin Hooks", () => {
       taskType: "chat",
       sticky: false,
       estCostUsd: 0.001,
+      alternates: [],
       reason: "test",
       ...overrides,
     };

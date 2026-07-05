@@ -2,6 +2,7 @@ import type { Dialect, ModelSpec, RouteDecision, RouterConfig, UpstreamProvider 
 import { getModel, listModels, normalizeModelId } from "./registry.ts";
 import type { Upstreams } from "./upstreams.ts";
 import { heuristicStrategy, structuralSignals, turnsOf, type Classification } from "./strategy.ts";
+import { estimateValueTokens } from "./tokens.ts";
 
 /** Back-compat convenience: continuous difficulty in [0,1] from the default heuristic. */
 export function estimateComplexity(body: any): number {
@@ -32,20 +33,19 @@ function isAutoModel(id: string): boolean {
   return norm === "auto" || norm === "model-router-auto";
 }
 
-/** Rough token split: conversation prefix (cacheable) vs this turn's fresh content. */
+/**
+ * Token split: conversation prefix (cacheable) vs this turn's fresh content.
+ * Content-aware estimation (CJK/code density) — see src/tokens.ts.
+ */
 export function estimateTokens(body: any): { history: number; fresh: number; output: number } {
   const turns = turnsOf(body);
-  const chars = (v: any) => {
-    try {
-      return JSON.stringify(v ?? "").length;
-    } catch {
-      return 0;
-    }
-  };
-  const total = chars(turns) + chars(body?.system ?? body?.instructions ?? "") + chars(body?.tools ?? "");
-  const last = turns.length ? chars(turns[turns.length - 1]) : 0;
-  const history = Math.ceil(Math.max(total - last, 0) / 4);
-  const fresh = Math.ceil(last / 4);
+  const total =
+    estimateValueTokens(turns) +
+    estimateValueTokens(body?.system ?? body?.instructions ?? "") +
+    estimateValueTokens(body?.tools ?? "");
+  const last = turns.length ? estimateValueTokens(turns[turns.length - 1]) : 0;
+  const history = Math.max(total - last, 0);
+  const fresh = last;
   const maxTokens = Number(body?.max_tokens ?? body?.max_completion_tokens ?? body?.max_output_tokens ?? 0);
   const output = Math.ceil(Math.min(maxTokens || 1600, 8000) / 2);
   return { history, fresh, output };
@@ -112,6 +112,7 @@ export function route(inputs: RouteInputs): RouteDecision {
     // Even a kept/passed-through model has an estimated cost — shadow-mode
     // comparisons and eval need it.
     estCostUsd: requested ? upstreams.estimateCostUsd(home, requested, tokens, warm(requested.id, home.name)) : 0,
+    alternates: [],
     reason,
   });
 
@@ -187,6 +188,13 @@ export function route(inputs: RouteInputs): RouteDecision {
   const sticky =
     pick.warm && !!cheapestCold && normalizeModelId(cheapestCold.spec.id) !== normalizeModelId(pick.spec.id);
 
+  // Next-best distinct pairs for automatic failover on retryable errors.
+  const alternates = pairs
+    .slice(1)
+    .filter((p, i, arr) => arr.findIndex((x) => x.upstream.name === p.upstream.name && x.spec.id === p.spec.id) === i)
+    .slice(0, 2)
+    .map((p) => ({ model: upstreams.wireModelId(p.upstream, p.spec, auto ? "" : requestedModel), upstream: p.upstream.name }));
+
   return {
     requestedModel,
     routedModel: upstreams.wireModelId(pick.upstream, pick.spec, auto ? "" : requestedModel),
@@ -199,6 +207,7 @@ export function route(inputs: RouteInputs): RouteDecision {
     taskType,
     sticky,
     estCostUsd: pick.cost,
+    alternates,
     reason:
       `${taskType} (confidence ${confidence.toFixed(2)})` +
       `${escalationBoost ? ` +${escalationBoost} escalation` : ""} -> tier ${requiredTier}; ` +

@@ -130,6 +130,11 @@ export interface RouteDecision {
   sticky: boolean;
   /** Estimated cost of this request on the chosen (model, upstream), USD. */
   estCostUsd: number;
+  /**
+   * Next-best (model, upstream) pairs, used for automatic failover when the
+   * chosen upstream returns a retryable error (429/5xx/unreachable).
+   */
+  alternates: Array<{ model: string; upstream: string }>;
   reason: string;
 }
 
@@ -342,6 +347,16 @@ export interface RouterConfig {
   crossProvider?: boolean;
   /** Per-conversation stuck-detection and tier bumping. Default true. */
   escalationEnabled?: boolean;
+  /**
+   * Retry retryable upstream failures (429/5xx/unreachable) on the next-best
+   * (model, upstream) pair before surfacing the error. Default true.
+   */
+  failover?: boolean;
+  /**
+   * Normalize volatile bytes (timestamps, UUIDs, long hex ids) out of the
+   * cache key so near-identical requests hit. Default true.
+   */
+  cacheNormalize?: boolean;
   /**
    * Routing strategy: "heuristic" (default — multi-signal task classifier,
    * sub-millisecond) or "llm" (a tier-1 model classifies each new

@@ -29,6 +29,9 @@ interface UpstreamState {
   openUntil: number;
   totalOk: number;
   totalFail: number;
+  /** Provider-reported remaining rate-limit fraction (0..1); held until throttleUntil. */
+  rateRemaining: number;
+  throttleUntil: number;
 }
 
 export class UpstreamHealth {
@@ -38,7 +41,7 @@ export class UpstreamHealth {
   private state(name: string): UpstreamState {
     let s = this.states.get(name);
     if (!s) {
-      s = { ewmaMs: 0, samples: 0, failures: [], openUntil: 0, totalOk: 0, totalFail: 0 };
+      s = { ewmaMs: 0, samples: 0, failures: [], openUntil: 0, totalOk: 0, totalFail: 0, rateRemaining: 1, throttleUntil: 0 };
       this.states.set(name, s);
     }
     return s;
@@ -70,10 +73,42 @@ export class UpstreamHealth {
   }
 
   /**
+   * Ingest provider rate-limit headers (Anthropic and OpenAI shapes). When an
+   * upstream reports < 5% of its request/token budget remaining, it is
+   * soft-throttled for 30s: deprioritized like an open circuit, but still
+   * fail-open when it is the only candidate.
+   */
+  noteRateLimit(name: string, headers: Headers): void {
+    const frac = (remainingKey: string, limitKey: string): number | null => {
+      const remaining = Number(headers.get(remainingKey));
+      const limit = Number(headers.get(limitKey));
+      return Number.isFinite(remaining) && Number.isFinite(limit) && limit > 0 ? remaining / limit : null;
+    };
+    const fractions = [
+      frac("anthropic-ratelimit-requests-remaining", "anthropic-ratelimit-requests-limit"),
+      frac("anthropic-ratelimit-tokens-remaining", "anthropic-ratelimit-tokens-limit"),
+      frac("x-ratelimit-remaining-requests", "x-ratelimit-limit-requests"),
+      frac("x-ratelimit-remaining-tokens", "x-ratelimit-limit-tokens"),
+    ].filter((f): f is number => f !== null);
+    if (fractions.length === 0) return;
+    const s = this.state(name);
+    s.rateRemaining = Math.min(...fractions);
+    s.throttleUntil = s.rateRemaining < 0.05 ? Date.now() + 30_000 : 0;
+  }
+
+  /** Nearly out of provider rate limit — deprioritize (soft, fail-open). */
+  throttled(name: string): boolean {
+    const s = this.states.get(name);
+    return !!s && s.throttleUntil > Date.now();
+  }
+
+  /**
    * Can this upstream take traffic? Open circuit = no, except a single probe
-   * window once the cooldown has elapsed (half-open).
+   * window once the cooldown has elapsed (half-open). Soft throttle counts
+   * as unavailable too — the router fails open when nothing else remains.
    */
   available(name: string): boolean {
+    if (this.throttled(name)) return false;
     const s = this.states.get(name);
     if (!s || !s.openUntil) return true;
     return Date.now() >= s.openUntil; // half-open: allow probes
@@ -90,6 +125,8 @@ export class UpstreamHealth {
     ok: number;
     failed: number;
     circuit: "closed" | "open" | "half-open";
+    rateRemaining: number;
+    throttled: boolean;
   }> {
     const now = Date.now();
     return [...this.states.entries()].map(([name, s]) => ({
@@ -98,6 +135,8 @@ export class UpstreamHealth {
       ok: s.totalOk,
       failed: s.totalFail,
       circuit: !s.openUntil ? "closed" : now >= s.openUntil ? "half-open" : "open",
+      rateRemaining: Number(s.rateRemaining.toFixed(3)),
+      throttled: s.throttleUntil > now,
     }));
   }
 }

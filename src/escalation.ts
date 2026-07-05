@@ -72,9 +72,63 @@ function countIncomingToolErrors(body: any): number {
   return errors;
 }
 
+import { Database } from "bun:sqlite";
+
 export class EscalationTracker {
   private convos = new Map<string, ConvoState>();
-  constructor(private config: EscalationConfig = DEFAULT_ESCALATION) {}
+  private db: Database | null = null;
+  private saveStmt: any = null;
+
+  /**
+   * With a dbPath, conversation state (escalation boosts and — critically —
+   * which model holds each conversation's warm prompt cache) survives proxy
+   * restarts, so the first request after a restart doesn't blow the cache by
+   * switching models.
+   */
+  constructor(
+    private config: EscalationConfig = DEFAULT_ESCALATION,
+    dbPath?: string,
+  ) {
+    if (!dbPath) return;
+    try {
+      this.db = new Database(dbPath);
+      this.db!.exec("PRAGMA journal_mode = WAL;");
+      this.db!.exec(`
+        CREATE TABLE IF NOT EXISTS conversations (
+          key TEXT PRIMARY KEY, boost INTEGER, signals INTEGER, successes INTEGER,
+          last_seen INTEGER, last_turn_count INTEGER, entries INTEGER,
+          last_model TEXT, last_upstream TEXT
+        )`);
+      this.saveStmt = this.db!.prepare(
+        `INSERT OR REPLACE INTO conversations
+         (key, boost, signals, successes, last_seen, last_turn_count, entries, last_model, last_upstream)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      const cutoff = Date.now() - this.config.ttlMs;
+      this.db!.prepare(`DELETE FROM conversations WHERE last_seen < ?`).run(cutoff);
+      const rows = this.db!.prepare(`SELECT * FROM conversations`).all() as any[];
+      for (const r of rows) {
+        this.convos.set(r.key, {
+          boost: r.boost, signals: r.signals, successes: r.successes,
+          lastSeen: r.last_seen, lastTurnCount: r.last_turn_count, entries: r.entries,
+          lastModel: r.last_model || undefined, lastUpstream: r.last_upstream || undefined,
+        });
+      }
+    } catch (err) {
+      console.error("[escalation] persistence unavailable (running in-memory):", err);
+      this.db = null;
+      this.saveStmt = null;
+    }
+  }
+
+  private persist(key: string, s: ConvoState): void {
+    if (!this.saveStmt) return;
+    try {
+      this.saveStmt.run(key, s.boost, s.signals, s.successes, s.lastSeen, s.lastTurnCount, s.entries, s.lastModel ?? "", s.lastUpstream ?? "");
+    } catch {
+      // persistence is best-effort
+    }
+  }
 
   private state(key: string): ConvoState {
     this.gc();
@@ -109,6 +163,7 @@ export class EscalationTracker {
     s.lastTurnCount = turns.length;
     s.lastSeen = now;
     this.applyThresholds(s);
+    this.persist(key, s);
     return s.boost;
   }
 
@@ -117,6 +172,7 @@ export class EscalationTracker {
     const s = this.state(key);
     s.lastModel = model;
     s.lastUpstream = upstream;
+    this.persist(key, s);
   }
 
   /** The (model, upstream) whose prompt cache is warm for this conversation, if any. */
@@ -140,6 +196,7 @@ export class EscalationTracker {
       s.successes = 0;
       this.applyThresholds(s);
     }
+    this.persist(key, s);
   }
 
   private applyThresholds(s: ConvoState): void {

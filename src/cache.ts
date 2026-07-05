@@ -15,9 +15,26 @@ function sortObjectKeys(obj: any): any {
   return sorted;
 }
 
-export function cacheKey(provider: string, body: any): string {
+/**
+ * Strip volatile bytes that make near-identical requests hash differently:
+ * ISO timestamps, 13-digit epoch millis, UUIDs, and long hex ids. Applied to
+ * the serialized form only — the request itself is never modified.
+ */
+export function normalizeForHash(serialized: string): string {
+  return serialized
+    .replace(/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?/g, "<TS>")
+    .replace(/\b\d{4}-\d{2}-\d{2}\b/g, "<DATE>")
+    .replace(/\b1[6-9]\d{11}\b/g, "<EPOCHMS>")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, "<UUID>")
+    .replace(/\b[0-9a-f]{24,64}\b/gi, "<HEX>");
+}
+
+export function cacheKey(provider: string, body: any, normalize = true): string {
   const toHash = {
     provider,
+    // Streaming and non-streaming responses are cached separately (a stream
+    // hit replays the raw SSE; a JSON hit returns the JSON body).
+    stream: body?.stream === true,
     model: body?.model,
     system: body?.system,
     messages: body?.messages,
@@ -34,7 +51,7 @@ export function cacheKey(provider: string, body: any): string {
 
   const stable = JSON.stringify(sortObjectKeys(toHash));
   const hasher = new Bun.CryptoHasher("sha256");
-  hasher.update(stable);
+  hasher.update(normalize ? normalizeForHash(stable) : stable);
   return hasher.digest("hex");
 }
 

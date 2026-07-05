@@ -51,6 +51,10 @@ const priceUpdater =
 const plugins = new PluginPipeline();
 if (Bun.env.PLUGIN_LOGGER !== "false") plugins.use(loggerPlugin());
 if (Bun.env.PLUGIN_TOON === "true") plugins.use(toonPlugin());
+if (Bun.env.PLUGIN_PRUNE === "true") {
+  const { prunePlugin } = await import("./plugins/prune.ts");
+  plugins.use(prunePlugin());
+}
 
 const rs = await startServer(config, plugins);
 

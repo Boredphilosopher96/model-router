@@ -15,6 +15,8 @@ export function loadConfig(env: Record<string, string | undefined> = Bun.env): R
     allowedModels: env.ROUTER_ALLOWED_MODELS?.split(",").map((s) => s.trim()).filter(Boolean),
     crossProvider: env.ROUTER_CROSS_PROVIDER === "true",
     escalationEnabled: env.ESCALATION !== "false",
+    failover: env.FAILOVER !== "false",
+    cacheNormalize: env.CACHE_NORMALIZE !== "false",
     strategy: env.ROUTER_STRATEGY === "llm" ? "llm" : "heuristic",
     shadow:
       env.SHADOW_MODE || env.SHADOW_STRATEGY

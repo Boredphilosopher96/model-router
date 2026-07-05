@@ -46,7 +46,7 @@ function dialectOf(pathname: string): Dialect | null {
 export async function startServer(config: RouterConfig, plugins: PluginPipeline = new PluginPipeline()): Promise<RouterServer> {
   const cache = createCache(config.dbPath, config.cacheTtlMs);
   const stats = createStats(config.dbPath);
-  const escalation = new EscalationTracker();
+  const escalation = new EscalationTracker(undefined, config.dbPath);
   const setup = await loadRouterSetup(config.upstreamsConfigPath, config.upstreams, config.allowedModels);
   const upstreams = setup.upstreams;
   await plugins.loadFromPaths([...setup.pluginPaths, ...(config.plugins ?? [])], (p) =>
@@ -121,17 +121,22 @@ export async function startServer(config: RouterConfig, plugins: PluginPipeline 
       return Response.json({ error: "invalid JSON body" }, { status: 400 });
     }
 
+    // Conversation identity is computed on the raw body so plugins that
+    // rewrite content don't change a conversation's fingerprint mid-flight.
+    const convo = conversationKey(dialect, body);
     const ctx: PluginContext = {
       provider: dialect,
       path,
       mount: home.name,
       requestedModel: String(body?.model ?? ""),
-      state: {},
+      state: {
+        // Warm-cache signal for cache-aware plugins (e.g. context pruning).
+        "model-router:lastRoute": escalation.lastRoute(convo),
+      },
     };
     body = await plugins.runRequest(body, ctx);
 
     // Escalation: has this conversation been struggling on a small model?
-    const convo = conversationKey(dialect, body);
     const boost = config.escalationEnabled === false ? 0 : escalation.observeRequest(convo, body);
 
     let classification = await strategy.classify(body, convo);
@@ -245,11 +250,19 @@ export async function startServer(config: RouterConfig, plugins: PluginPipeline 
       });
     };
 
-    // ---- cache lookup (non-streaming only) ----
-    const key = config.cacheEnabled && !isStream ? cacheKey(dialect, body) : null;
+    // ---- cache lookup (streaming and non-streaming, cached separately) ----
+    const key = config.cacheEnabled ? cacheKey(dialect, body, config.cacheNormalize !== false) : null;
     if (key) {
       const hit = cache.get(key);
       if (hit) {
+        if (isStream) {
+          // Replay the cached SSE byte-for-byte — a free streaed response.
+          record(extractStreamUsage(dialect, hit.body), true, performance.now() - t0);
+          return new Response(hit.body, {
+            status: 200,
+            headers: { "content-type": "text/event-stream", "cache-control": "no-cache", ...routerHeaders, "x-router-cache": "hit" },
+          });
+        }
         let json = JSON.parse(hit.body);
         record(extractUsage(dialect, json), true, performance.now() - t0);
         json = await plugins.runResponse(json, ctx);
@@ -258,26 +271,72 @@ export async function startServer(config: RouterConfig, plugins: PluginPipeline 
       }
     }
 
-    // ---- forward upstream with the routed model ----
-    let outBody = { ...body, model: decision.routedModel };
-    if (adapter?.transformRequest) outBody = await adapter.transformRequest(outBody, target);
-    let upstream: Response;
-    try {
-      upstream = await fetch(upstreams.url(target, path), {
-        method: "POST",
-        headers: upstreams.headers(target, dialect, req.headers, isHomeTarget),
-        body: JSON.stringify(outBody),
-      });
-    } catch (err) {
-      escalation.observeOutcome(convo, "failure");
-      health.note(target.name, false, performance.now() - t0);
-      return Response.json({ error: `upstream unreachable: ${String(err)}` }, { status: 502 });
+    // ---- forward upstream, failing over to next-best pairs on retryable errors ----
+    // Retry is safe even for streaming: failures surface at the response
+    // headers, before any bytes reach the client. A stream that dies mid-body
+    // cannot be retried and is passed through as-is.
+    const attempts: Array<{ model: string; upstream: string }> = [
+      { model: decision.routedModel, upstream: decision.upstream },
+      ...(config.failover !== false ? decision.alternates : []),
+    ];
+    let upstream: Response | null = null;
+    let lastError: { status: number; body: string; contentType: string } | null = null;
+    let served = attempts[0]!;
+    let servedUpstream = target;
+
+    for (let i = 0; i < attempts.length; i++) {
+      const attempt = attempts[i]!;
+      const attemptUpstream = upstreams.get(attempt.upstream) ?? home;
+      const attemptAdapter = upstreams.adapterOf(attemptUpstream.name);
+      let outBody = { ...body, model: attempt.model };
+      if (attemptAdapter?.transformRequest) outBody = await attemptAdapter.transformRequest(outBody, attemptUpstream);
+      const attemptStart = performance.now();
+      let resp: Response;
+      try {
+        resp = await fetch(upstreams.url(attemptUpstream, path), {
+          method: "POST",
+          headers: upstreams.headers(attemptUpstream, dialect, req.headers, attemptUpstream.name === home.name),
+          body: JSON.stringify(outBody),
+        });
+      } catch (err) {
+        // Upstream-level failure: penalize health only. The conversation-level
+        // escalation signal fires once, and only if every candidate fails.
+        health.note(attemptUpstream.name, false, performance.now() - attemptStart);
+        lastError = { status: 502, body: JSON.stringify({ error: `upstream unreachable: ${String(err)}` }), contentType: "application/json" };
+        continue;
+      }
+      const retryable = resp.status === 429 || resp.status >= 500;
+      health.note(attemptUpstream.name, !retryable, performance.now() - attemptStart);
+      health.noteRateLimit(attemptUpstream.name, resp.headers);
+      if (retryable) {
+        lastError = { status: resp.status, body: await resp.text(), contentType: resp.headers.get("content-type") ?? "application/json" };
+        continue;
+      }
+      upstream = resp;
+      served = attempt;
+      servedUpstream = attemptUpstream;
+      if (i > 0) {
+        decision = { ...decision, routedModel: attempt.model, upstream: attempt.upstream, reason: `${decision.reason}; +failover(${i})` };
+        routerHeaders["x-router-routed-model"] = headerSafe(attempt.model);
+        routerHeaders["x-router-upstream"] = headerSafe(attempt.upstream);
+        routerHeaders["x-router-failover"] = String(i);
+        ctx.routedModel = attempt.model;
+      }
+      break;
     }
 
-    health.note(target.name, !(upstream.status === 429 || upstream.status >= 500), performance.now() - t0);
+    if (!upstream) {
+      // Every candidate failed — the harness sees the error, so the
+      // conversation gets exactly one failure signal.
+      escalation.observeOutcome(convo, "failure");
+      return new Response(lastError?.body ?? JSON.stringify({ error: "all upstreams failed" }), {
+        status: lastError?.status ?? 502,
+        headers: { "content-type": lastError?.contentType ?? "application/json", ...routerHeaders },
+      });
+    }
+    const adapterFinal = upstreams.adapterOf(servedUpstream.name);
     if (!upstream.ok) {
-      if (upstream.status === 429 || upstream.status >= 500) escalation.observeOutcome(convo, "failure");
-      // Pass provider errors through untouched so the harness sees the real failure.
+      // Non-retryable provider error (4xx): pass through untouched.
       const errText = await upstream.text();
       return new Response(errText, {
         status: upstream.status,
@@ -286,7 +345,8 @@ export async function startServer(config: RouterConfig, plugins: PluginPipeline 
     }
 
     if (isStream) {
-      // Pass the SSE stream through while teeing chunks to extract usage afterwards.
+      // Pass the SSE stream through while teeing chunks to extract usage,
+      // cache the full stream for replay, and sample for calibration.
       const [toClient, toParser] = upstream.body!.tee();
       (async () => {
         try {
@@ -294,6 +354,22 @@ export async function startServer(config: RouterConfig, plugins: PluginPipeline 
           const usage = extractStreamUsage(dialect, text);
           record(usage, false, performance.now() - t0);
           escalation.observeOutcome(convo, /"stop_reason"\s*:\s*"refusal"/.test(text) ? "refusal" : "ok");
+          if (key && text.length < 2_000_000) {
+            try {
+              cache.set(key, text, decision.routedModel);
+            } catch (err) {
+              console.error("[cache] failed to store stream:", err);
+            }
+          }
+          if (calibration && decision.routedModel !== decision.requestedModel && !decision.auto) {
+            calibration.maybeSample({
+              taskType: decision.taskType,
+              requiredTier: decision.requiredTier,
+              routedModel: decision.routedModel,
+              prompt: lastUserText(body),
+              response: extractStreamText(dialect, text),
+            });
+          }
         } catch (err) {
           console.error("[stream] usage extraction failed:", err);
         }
@@ -309,8 +385,8 @@ export async function startServer(config: RouterConfig, plugins: PluginPipeline 
     }
 
     let json: any = await upstream.json();
-    if (adapter?.transformResponse) json = await adapter.transformResponse(json, target);
-    record(adapter?.extractUsage?.(json) ?? extractUsage(dialect, json), false, performance.now() - t0);
+    if (adapterFinal?.transformResponse) json = await adapterFinal.transformResponse(json, servedUpstream);
+    record(adapterFinal?.extractUsage?.(json) ?? extractUsage(dialect, json), false, performance.now() - t0);
     escalation.observeOutcome(convo, json?.stop_reason === "refusal" ? "refusal" : "ok");
     if (key) {
       try {
@@ -449,6 +525,30 @@ export async function startServer(config: RouterConfig, plugins: PluginPipeline 
       server.stop(true);
     },
   };
+}
+
+/** Reassemble the response text from an accumulated SSE stream body. */
+export function extractStreamText(dialect: Dialect, sseText: string): string {
+  const parts: string[] = [];
+  for (const line of sseText.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === "[DONE]") continue;
+    try {
+      const evt = JSON.parse(payload);
+      if (dialect === "anthropic") {
+        if (evt?.type === "content_block_delta" && typeof evt?.delta?.text === "string") parts.push(evt.delta.text);
+      } else {
+        // chat completions deltas + Responses API output_text deltas
+        const chat = evt?.choices?.[0]?.delta?.content;
+        if (typeof chat === "string") parts.push(chat);
+        if (evt?.type === "response.output_text.delta" && typeof evt?.delta === "string") parts.push(evt.delta);
+      }
+    } catch {
+      // partial lines are expected
+    }
+  }
+  return parts.join("");
 }
 
 /** Parse token usage out of an accumulated SSE stream body. */

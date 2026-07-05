@@ -1,9 +1,24 @@
 name: Publish to npm
 
-# Publishes when a GitHub release is published (recommended flow:
-# bump package.json version -> update CHANGELOG.md -> create a release
-# tagged vX.Y.Z). Requires the NPM_TOKEN repository secret (an npm
-# automation token). Provenance attestation is enabled via OIDC.
+# Publishes @curliness8029/model-router when a GitHub release is published.
+# Flow: bump package.json version -> update CHANGELOG.md -> create a release
+# tagged vX.Y.Z (gh release create v1.0.1 --notes "...").
+#
+# AUTH — trusted publishing (OIDC), the recommended zero-secret path:
+#   Configure once on npmjs.com -> package -> Settings -> Trusted Publisher:
+#     Organization or user: Boredphilosopher96
+#     Repository:           model-router
+#     Workflow filename:    publish.yml
+#     Allowed actions:      "npm publish"
+#   After that, NO token or secret is needed: GitHub mints a short-lived
+#   OIDC credential per run (that's what `id-token: write` below grants),
+#   and npm exchanges it automatically. Provenance is attached by default.
+#   Requires npm >= 11.5.1 (Node 24 ships npm 11; we upgrade to be sure).
+#
+# ALTERNATIVE — granular access token (note: write tokens expire in <= 90
+# days, so this path needs recurring rotation):
+#   1. Create the token (see docs) and: gh secret set NPM_TOKEN
+#   2. Uncomment the two marked blocks below.
 
 on:
   release:
@@ -12,7 +27,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write # npm provenance
+  id-token: write # OIDC for npm trusted publishing + provenance
 
 jobs:
   publish:
@@ -25,11 +40,15 @@ jobs:
         with:
           bun-version: latest
 
-      # npm CLI (for publish + provenance) comes from Node
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
+          node-version: 24
+          # TOKEN AUTH ONLY — uncomment when using NPM_TOKEN instead of
+          # trusted publishing:
+          # registry-url: https://registry.npmjs.org
+
+      - name: Ensure npm supports trusted publishing (>= 11.5.1)
+        run: npm install -g npm@latest && npm --version
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -50,6 +69,8 @@ jobs:
           fi
 
       - name: Publish
-        run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish
+        # TOKEN AUTH ONLY — uncomment when using NPM_TOKEN instead of
+        # trusted publishing:
+        # env:
+        #   NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

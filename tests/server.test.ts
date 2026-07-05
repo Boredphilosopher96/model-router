@@ -102,6 +102,10 @@ describe("server integration", () => {
     const upstreamHeader = response.headers.get("x-router-upstream");
     expect(upstreamHeader).toBe("openai");
 
+    // Check x-router-task header is present
+    const taskHeader = response.headers.get("x-router-task");
+    expect(taskHeader).not.toBeNull();
+
     // Check response body .model is rewritten to requested model
     const json: any = await response.json();
     expect(json.model).toBe("gpt-5.4");
@@ -213,5 +217,29 @@ data: {"type":"other"}`;
     const usage = extractStreamUsage("openai", sseText);
     expect(usage.inputTokens).toBe(5);
     expect(usage.outputTokens).toBe(2);
+  });
+
+  it("GET /api/router-eval returns JSON with numeric totalDecisions after a request", async () => {
+    expect(appServer).not.toBeNull();
+    const appUrl = `http://localhost:${appServer!.server.port}`;
+
+    // Make a request to generate some routing decisions
+    await fetch(`${appUrl}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-5.4",
+        input: "test",
+        max_output_tokens: 10,
+      }),
+    });
+
+    // Query the router eval endpoint
+    const response = await fetch(`${appUrl}/api/router-eval`);
+    expect(response.ok).toBe(true);
+
+    const json: any = await response.json();
+    expect(typeof json.totalDecisions).toBe("number");
+    expect(json.totalDecisions).toBeGreaterThan(0);
   });
 });

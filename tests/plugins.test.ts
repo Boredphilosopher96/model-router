@@ -35,6 +35,7 @@ describe("PluginPipeline", () => {
 
     const ctx: PluginContext = {
       provider: "anthropic",
+      mount: "anthropic",
       path: "/v1/messages",
       requestedModel: "claude-opus-4-8",
       state: {},
@@ -76,6 +77,7 @@ describe("PluginPipeline", () => {
 
     const ctx: PluginContext = {
       provider: "anthropic",
+      mount: "anthropic",
       path: "/v1/messages",
       requestedModel: "claude-opus-4-8",
       state: {},
@@ -116,6 +118,7 @@ describe("PluginPipeline", () => {
 
     const ctx: PluginContext = {
       provider: "anthropic",
+      mount: "anthropic",
       path: "/v1/messages",
       requestedModel: "claude-opus-4-8",
       state: {},
@@ -148,6 +151,7 @@ describe("toonPlugin", () => {
 
     const ctx: PluginContext = {
       provider: "anthropic",
+      mount: "anthropic",
       path: "/v1/messages",
       requestedModel: "claude-opus-4-8",
       state: {},
@@ -176,6 +180,7 @@ describe("toonPlugin", () => {
 
     const ctx: PluginContext = {
       provider: "anthropic",
+      mount: "anthropic",
       path: "/v1/messages",
       requestedModel: "claude-opus-4-8",
       state: {},
@@ -200,5 +205,164 @@ describe("toonPlugin", () => {
     expect(result).toContain("items[2]{id,name}:");
     expect(result).toContain("1,a");
     expect(result).toContain("2,b");
+  });
+});
+
+describe("Plugin composability: priority and matching", () => {
+  it("priority 1 plugin runs before default 100 regardless of registration order", async () => {
+    const order: string[] = [];
+
+    const highPriority: ProxyPlugin = {
+      name: "high-priority",
+      priority: 1,
+      onRequest(body, ctx) {
+        order.push("high-priority");
+        return body;
+      },
+    };
+
+    const defaultPriority: ProxyPlugin = {
+      name: "default-priority",
+      onRequest(body, ctx) {
+        order.push("default-priority");
+        return body;
+      },
+    };
+
+    // Register in reverse priority order
+    const pipeline = new PluginPipeline();
+    pipeline.use(defaultPriority).use(highPriority);
+
+    const ctx: PluginContext = {
+      provider: "anthropic",
+      mount: "anthropic",
+      path: "/v1/messages",
+      requestedModel: "claude-opus-4-8",
+      state: {},
+    };
+
+    await pipeline.runRequest({}, ctx);
+    // high-priority should run first despite being registered second
+    expect(order).toEqual(["high-priority", "default-priority"]);
+  });
+
+  it("plugin with match {mounts:[\"anthropic\"]} runs only when ctx.mount===\"anthropic\"", async () => {
+    const ran: string[] = [];
+
+    const scopedPlugin: ProxyPlugin = {
+      name: "anthropic-only",
+      match: { mounts: ["anthropic"] },
+      onRequest(body, ctx) {
+        ran.push("anthropic-only");
+        return body;
+      },
+    };
+
+    const pipeline = new PluginPipeline();
+    pipeline.use(scopedPlugin);
+
+    // Test with anthropic mount
+    const ctxAnthropic: PluginContext = {
+      provider: "anthropic",
+      mount: "anthropic",
+      path: "/v1/messages",
+      requestedModel: "claude-opus-4-8",
+      state: {},
+    };
+    await pipeline.runRequest({}, ctxAnthropic);
+    expect(ran).toContain("anthropic-only");
+
+    ran.length = 0;
+
+    // Test with copilot mount (should be skipped)
+    const ctxCopilot: PluginContext = {
+      provider: "openai",
+      mount: "copilot",
+      path: "/v1/chat/completions",
+      requestedModel: "gpt-5.4",
+      state: {},
+    };
+    await pipeline.runRequest({}, ctxCopilot);
+    expect(ran).not.toContain("anthropic-only");
+  });
+
+  it("plugin with match {models:[\"claude-*\"]} skipped for gpt request", async () => {
+    const ran: string[] = [];
+
+    const claudeOnly: ProxyPlugin = {
+      name: "claude-only",
+      match: { models: ["claude-*"] },
+      onRequest(body, ctx) {
+        ran.push("claude-only");
+        return body;
+      },
+    };
+
+    const pipeline = new PluginPipeline();
+    pipeline.use(claudeOnly);
+
+    // Test with claude model
+    const ctxClaude: PluginContext = {
+      provider: "anthropic",
+      mount: "anthropic",
+      path: "/v1/messages",
+      requestedModel: "claude-opus-4-8",
+      state: {},
+    };
+    await pipeline.runRequest({}, ctxClaude);
+    expect(ran).toContain("claude-only");
+
+    ran.length = 0;
+
+    // Test with gpt model (should be skipped)
+    const ctxGpt: PluginContext = {
+      provider: "openai",
+      mount: "openai",
+      path: "/v1/chat/completions",
+      requestedModel: "gpt-5.4-nano",
+      state: {},
+    };
+    await pipeline.runRequest({}, ctxGpt);
+    expect(ran).not.toContain("claude-only");
+  });
+
+  it("composePlugins merges two plugins in inner order", async () => {
+    const order: string[] = [];
+
+    const plugin1: ProxyPlugin = {
+      name: "plugin1",
+      onRequest(body, ctx) {
+        order.push("plugin1");
+        return body;
+      },
+    };
+
+    const plugin2: ProxyPlugin = {
+      name: "plugin2",
+      onRequest(body, ctx) {
+        order.push("plugin2");
+        return body;
+      },
+    };
+
+    const composed = (() => {
+      const { composePlugins } = require("../src/plugins/index.ts");
+      return composePlugins("composed", [plugin1, plugin2]);
+    })();
+
+    const pipeline = new PluginPipeline();
+    pipeline.use(composed);
+
+    const ctx: PluginContext = {
+      provider: "anthropic",
+      mount: "anthropic",
+      path: "/v1/messages",
+      requestedModel: "claude-opus-4-8",
+      state: {},
+    };
+
+    await pipeline.runRequest({}, ctx);
+    // Should run in inner order
+    expect(order).toEqual(["plugin1", "plugin2"]);
   });
 });

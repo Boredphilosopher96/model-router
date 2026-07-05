@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "bun:test";
+import { describe, it, expect, afterEach, afterAll } from "bun:test";
 import {
   setModelAllowlist,
   listModels,
@@ -6,11 +6,13 @@ import {
   registerModel,
   normalizeModelId,
 } from "../src/registry.ts";
-import { route, requestNeedsVision, requestUsesTools } from "../src/router.ts";
+import { route, requestNeedsVision, requestUsesTools, type RouteInputs } from "../src/router.ts";
 import { Upstreams, DEFAULT_UPSTREAMS, loadRouterSetup, kindOf } from "../src/upstreams.ts";
 import { parseGatewayFeed } from "../src/pricefeed.ts";
 import { PluginPipeline, type ProxyPlugin, type PluginContext } from "../src/plugins/index.ts";
+import { heuristicStrategy, type Classification } from "../src/strategy.ts";
 import type { UpstreamProvider, RouteDecision } from "../src/types.ts";
+import { rmSync, mkdirSync } from "fs";
 
 /** Type for feed entries in parseGatewayFeed (not exported from pricefeed.ts) */
 interface FeedEntry {
@@ -21,6 +23,24 @@ interface FeedEntry {
   max_input_tokens?: number;
   supports_vision?: boolean;
   supports_function_calling?: boolean;
+}
+
+// Helper for trivial classification
+function trivialClassification(): Classification {
+  return {
+    taskType: "chat",
+    requiredTier: 1,
+    complexity: 0.1,
+    confidence: 0.9,
+    reasons: [],
+  };
+}
+
+function routeWithClassification(inputs: Omit<RouteInputs, "classification">, classification?: Classification) {
+  return route({
+    ...inputs,
+    classification: classification || trivialClassification(),
+  });
 }
 
 describe("Features: Allowlist", () => {
@@ -53,7 +73,13 @@ describe("Features: Allowlist", () => {
       messages: [{ role: "user", content: "hi" }],
     };
 
-    const decision = route(body, "anthropic", home, ups, { mode: "aggressive" });
+    const decision = routeWithClassification({
+      body,
+      dialect: "anthropic",
+      home,
+      upstreams: ups,
+      config: { mode: "aggressive", crossProvider: false },
+    });
     expect(decision.routedModel).toBe("claude-haiku-4-5");
   });
 
@@ -67,7 +93,13 @@ describe("Features: Allowlist", () => {
       messages: [{ role: "user", content: "hi" }],
     };
 
-    const decision = route(body, "anthropic", home, ups, { mode: "aggressive" });
+    const decision = routeWithClassification({
+      body,
+      dialect: "anthropic",
+      home,
+      upstreams: ups,
+      config: { mode: "aggressive", crossProvider: false },
+    });
     // Opus is allowed, so it's the only option; it should be kept
     expect(decision.routedModel).toBe("claude-opus-4-8");
   });
@@ -166,7 +198,13 @@ describe("Features: Capability Routing", () => {
       messages: [{ role: "user", content: "just text" }],
     };
 
-    const decision = route(body, "anthropic", home, ups, { mode: "aggressive" });
+    const decision = routeWithClassification({
+      body,
+      dialect: "anthropic",
+      home,
+      upstreams: ups,
+      config: { mode: "aggressive", crossProvider: false },
+    });
     expect(decision.routedModel).toBe("tiny-text");
   });
 
@@ -197,10 +235,51 @@ describe("Features: Capability Routing", () => {
       ],
     };
 
-    const decision = route(body, "anthropic", home, ups, { mode: "aggressive" });
+    const decision = routeWithClassification({
+      body,
+      dialect: "anthropic",
+      home,
+      upstreams: ups,
+      config: { mode: "aggressive", crossProvider: false },
+    });
     // Should not route to tiny-text (vision: false), instead haiku (vision-capable)
     expect(decision.routedModel).toBe("claude-haiku-4-5");
     expect(decision.routedModel).not.toBe("tiny-text");
+  });
+});
+
+describe("Features: resolveUpstream Presets", () => {
+  it("resolveUpstream(\"github-copilot\") yields github-copilot endpoint with openai dialect", async () => {
+    const { resolveUpstream } = await import("../src/upstreams.ts");
+    const resolved = resolveUpstream("github-copilot");
+    expect(resolved.name).toBe("github-copilot");
+    expect(resolved.baseUrl).toBe("https://api.githubcopilot.com");
+    expect(resolved.dialect).toBe("openai");
+    expect(resolved.stripV1).toBe(true);
+    expect(resolved.crossProvider).toBe(true);
+  });
+
+  it("resolveUpstream with user preset override keeps apiKeyEnv", async () => {
+    const { resolveUpstream } = await import("../src/upstreams.ts");
+    const resolved = resolveUpstream({
+      name: "my-openrouter",
+      preset: "openrouter",
+      apiKeyEnv: "MY_KEY",
+    });
+    expect(resolved.name).toBe("my-openrouter");
+    expect(resolved.preset).toBe("openrouter");
+    expect(resolved.apiKeyEnv).toBe("MY_KEY");
+    expect(resolved.vendorPrefix).toBe(true);
+  });
+
+  it("resolveUpstream with bad name and no preset throws", async () => {
+    const { resolveUpstream } = await import("../src/upstreams.ts");
+    expect(() => {
+      resolveUpstream({
+        name: "bad-upstream",
+        // No preset, no baseUrl/dialect
+      });
+    }).toThrow();
   });
 });
 
@@ -277,7 +356,13 @@ describe("Features: Upstreams Auto-Pricing", () => {
   });
 
   it("upstream with custom pricing registers model and pricesFor returns custom prices", async () => {
-    const configPath = `${import.meta.dir}/temp-router-config.json`;
+    const tmpDir = `${import.meta.dir}/.tmp`;
+    try {
+      mkdirSync(tmpDir);
+    } catch {
+      // already exists
+    }
+    const configPath = `${tmpDir}/temp-router-config.json`;
     const config = {
       providers: [
         {
@@ -349,24 +434,49 @@ describe("Features: Upstreams Auto-Pricing", () => {
 });
 
 describe("Features: Plugin Hooks", () => {
-  afterEach(async () => {
-    // Clean up temp plugin files
-    const tempPaths = [
-      `${import.meta.dir}/temp-plugin.ts`,
-      `${import.meta.dir}/temp-factory-plugin.ts`,
-    ];
-    for (const tempPath of tempPaths) {
-      try {
-        const file = Bun.file(tempPath);
-        if (await file.exists()) {
-          await Bun.write(tempPath, "");
-          // Try to remove by overwriting with empty content
-        }
-      } catch {
-        // ignore
-      }
+  const tmpDir = `${import.meta.dir}/.tmp`;
+
+  afterAll(() => {
+    // Clean up temp directory
+    try {
+      rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      // ignore
     }
   });
+
+  const getTmpPath = (name: string) => `${tmpDir}/${name}`;
+
+  // Helper for creating minimal RouteDecision fixtures
+  function createDecision(overrides?: Partial<RouteDecision>): RouteDecision {
+    return {
+      requestedModel: "claude-opus-4-8",
+      routedModel: "claude-haiku-4-5",
+      upstream: "anthropic",
+      provider: "anthropic",
+      complexity: 0.5,
+      requiredTier: 2,
+      escalationBoost: 0,
+      auto: false,
+      taskType: "chat",
+      sticky: false,
+      estCostUsd: 0.001,
+      reason: "test",
+      ...overrides,
+    };
+  }
+
+  // Helper for creating minimal PluginContext fixtures
+  function createCtx(overrides?: Partial<PluginContext>): PluginContext {
+    return {
+      provider: "anthropic",
+      mount: "anthropic",
+      path: "/v1/messages",
+      requestedModel: "claude-opus-4-8",
+      state: {},
+      ...overrides,
+    };
+  }
 
   it("runRouteDecision allows plugin to replace the decision", async () => {
     const pipeline = new PluginPipeline();
@@ -380,24 +490,8 @@ describe("Features: Plugin Hooks", () => {
 
     pipeline.use(plugin);
 
-    const originalDecision: RouteDecision = {
-      requestedModel: "claude-opus-4-8",
-      routedModel: "claude-haiku-4-5",
-      upstream: "anthropic",
-      provider: "anthropic",
-      complexity: 0.5,
-      requiredTier: 2,
-      escalationBoost: 0,
-      auto: false,
-      reason: "test",
-    };
-
-    const ctx: PluginContext = {
-      provider: "anthropic",
-      path: "/v1/messages",
-      requestedModel: "claude-opus-4-8",
-      state: {},
-    };
+    const originalDecision = createDecision();
+    const ctx = createCtx();
 
     const result = await pipeline.runRouteDecision(originalDecision, {}, ctx);
     expect(result.routedModel).toBe("x");
@@ -415,24 +509,8 @@ describe("Features: Plugin Hooks", () => {
 
     pipeline.use(plugin);
 
-    const originalDecision: RouteDecision = {
-      requestedModel: "claude-opus-4-8",
-      routedModel: "claude-haiku-4-5",
-      upstream: "anthropic",
-      provider: "anthropic",
-      complexity: 0.5,
-      requiredTier: 2,
-      escalationBoost: 0,
-      auto: false,
-      reason: "test",
-    };
-
-    const ctx: PluginContext = {
-      provider: "anthropic",
-      path: "/v1/messages",
-      requestedModel: "claude-opus-4-8",
-      state: {},
-    };
+    const originalDecision = createDecision();
+    const ctx = createCtx();
 
     const result = await pipeline.runRouteDecision(originalDecision, {}, ctx);
     expect(result.routedModel).toBe("claude-haiku-4-5");
@@ -450,24 +528,8 @@ describe("Features: Plugin Hooks", () => {
 
     pipeline.use(plugin);
 
-    const originalDecision: RouteDecision = {
-      requestedModel: "claude-opus-4-8",
-      routedModel: "claude-haiku-4-5",
-      upstream: "anthropic",
-      provider: "anthropic",
-      complexity: 0.5,
-      requiredTier: 2,
-      escalationBoost: 0,
-      auto: false,
-      reason: "test",
-    };
-
-    const ctx: PluginContext = {
-      provider: "anthropic",
-      path: "/v1/messages",
-      requestedModel: "claude-opus-4-8",
-      state: {},
-    };
+    const originalDecision = createDecision();
+    const ctx = createCtx();
 
     const result = await pipeline.runRouteDecision(originalDecision, {}, ctx);
     // Decision should be kept despite throw
@@ -501,14 +563,15 @@ describe("Features: Plugin Hooks", () => {
       cacheHit: false,
       downgraded: true,
       latencyMs: 500,
+      taskType: "chat",
+      complexity: 0.1,
+      requiredTier: 1,
+      escalationBoost: 0,
+      sticky: false,
+      conversation: "conv-123",
     };
 
-    const ctx: PluginContext = {
-      provider: "anthropic",
-      path: "/v1/messages",
-      requestedModel: "claude-opus-4-8",
-      state: {},
-    };
+    const ctx = createCtx();
 
     await pipeline.runRecord(record, ctx);
     expect(capturedRecord).toBe(record);
@@ -540,21 +603,27 @@ describe("Features: Plugin Hooks", () => {
       cacheHit: false,
       downgraded: true,
       latencyMs: 500,
+      taskType: "chat",
+      complexity: 0.1,
+      requiredTier: 1,
+      escalationBoost: 0,
+      sticky: false,
+      conversation: "conv-123",
     };
 
-    const ctx: PluginContext = {
-      provider: "anthropic",
-      path: "/v1/messages",
-      requestedModel: "claude-opus-4-8",
-      state: {},
-    };
+    const ctx = createCtx();
 
     // Should not throw
     await pipeline.runRecord(record, ctx);
   });
 
   it("loadFromPaths loads a plugin from a module file", async () => {
-    const tempPluginPath = `${import.meta.dir}/temp-plugin.ts`;
+    const tempPluginPath = getTmpPath("temp-plugin.ts");
+    try {
+      mkdirSync(tmpDir);
+    } catch {
+      // already exists
+    }
 
     const pluginCode = `export default {
   name: "temp-plugin",
@@ -567,9 +636,9 @@ describe("Features: Plugin Hooks", () => {
 
     const pipeline = new PluginPipeline();
     const resolve = (p: string) => {
-      // For relative paths, resolve against import.meta.dir
+      // For relative paths, resolve against tmpDir
       if (p.startsWith(".")) {
-        return `${import.meta.dir}/${p.slice(2)}`;
+        return `${tmpDir}/${p.slice(2)}`;
       }
       return p;
     };
@@ -587,7 +656,7 @@ describe("Features: Plugin Hooks", () => {
     const pipeline = new PluginPipeline();
 
     // Should not throw even if path doesn't exist
-    const nonExistentPath = `${import.meta.dir}/nonexistent-plugin-xyz.ts`;
+    const nonExistentPath = `${tmpDir}/nonexistent-plugin-xyz.ts`;
     await pipeline.loadFromPaths([nonExistentPath], (p: string) => p);
 
     const names = pipeline.list();
@@ -595,7 +664,12 @@ describe("Features: Plugin Hooks", () => {
   });
 
   it("loadFromPaths works with factory function", async () => {
-    const tempPluginPath = `${import.meta.dir}/temp-factory-plugin.ts`;
+    const tempPluginPath = getTmpPath("temp-factory-plugin.ts");
+    try {
+      mkdirSync(tmpDir);
+    } catch {
+      // already exists
+    }
 
     const pluginCode = `export default function createPlugin() {
   return {
@@ -611,7 +685,7 @@ describe("Features: Plugin Hooks", () => {
     const pipeline = new PluginPipeline();
     const resolve = (p: string) => {
       if (p.startsWith(".")) {
-        return `${import.meta.dir}/${p.slice(2)}`;
+        return `${tmpDir}/${p.slice(2)}`;
       }
       return p;
     };

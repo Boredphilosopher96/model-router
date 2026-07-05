@@ -7,7 +7,7 @@ Three extension points, all designed to fail open — a broken extension logs an
 A plugin hooks into the proxy layer. Every hook is optional.
 
 ```ts
-import type { ProxyPlugin } from "model-router";
+import type { ProxyPlugin } from "@boredphilosopher96/model-router";
 
 const plugin: ProxyPlugin = {
   name: "my-plugin",
@@ -53,7 +53,7 @@ const plugin: ProxyPlugin = {
 2. **Library API**:
 
    ```ts
-   import { startServer, loadConfig, PluginPipeline } from "model-router";
+   import { startServer, loadConfig, PluginPipeline } from "@boredphilosopher96/model-router";
    await startServer(loadConfig(), new PluginPipeline().use(plugin));
    ```
 
@@ -73,7 +73,7 @@ When one gateway serves a *different model shape* — nonstandard request fields
 
 ```ts
 // adapters/mygateway.ts
-import type { UpstreamAdapter } from "model-router";
+import type { UpstreamAdapter } from "@boredphilosopher96/model-router";
 
 const adapter: UpstreamAdapter = {
   // Reshape the outgoing body (the router has already swapped the model).
@@ -117,7 +117,7 @@ import {
   Upstreams, loadRouterSetup,          // upstream pool
   EscalationTracker, conversationKey,  // escalation
   startPriceAutoUpdate,                // price feed
-} from "model-router";
+} from "@boredphilosopher96/model-router";
 
 const rs = await startServer(loadConfig(), new PluginPipeline());
 // rs.server, rs.upstreams, rs.cache, rs.stats, rs.escalation, rs.stop()
